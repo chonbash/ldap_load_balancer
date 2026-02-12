@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: "LDAP LB"
+    orgId: 1
+    folder: "LDAP Load Balancer"
+    type: file
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+    disableDeletion: false
+    updateIntervalSeconds: 30

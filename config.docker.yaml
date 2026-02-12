@@ -1,0 +1,24 @@
+listen:
+  url: "ldap://:1389"
+
+# HTTP endpoint for Prometheus (GET /metrics)
+metrics_listen: "0.0.0.0:9090"
+
+backend:
+  bind:
+    method: "simple"
+    binddn: "cn=admin,dc=example,dc=com"
+    credentials: "secret"
+    network_timeout: 5
+  servers:
+    - uri: "ldap://ldap1:389"
+      retry: 5000
+      numconns: 5
+      bindconns: 2
+    - uri: "ldap://ldap2:389"
+      retry: 5000
+      numconns: 5
+      bindconns: 2
+
+io_threads: 2
+proxyauthz: false

@@ -1,0 +1,130 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.16
+    command:
+      - /usr/local/bin/etcd
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+    ports:
+      - "12379:2379"
+    networks:
+      - ldapnet
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # OpenLDAP backends (servercontainers/samba — файловый сервер без LDAP; для проверки LB используем OpenLDAP)
+  ldap1:
+    image: osixia/openldap:1.5.0
+    hostname: ldap1
+    environment:
+      LDAP_ORGANISATION: Example
+      LDAP_DOMAIN: example.com
+      LDAP_BASE_DN: dc=example,dc=com
+      LDAP_ADMIN_PASSWORD: secret
+      # LDAPS configuration
+      LDAP_TLS: "true"
+      LDAP_TLS_CRT_FILENAME: ldap1.crt
+      LDAP_TLS_KEY_FILENAME: ldap1.key
+      LDAP_TLS_CA_CRT_FILENAME: ca.crt
+      LDAP_TLS_VERIFY_CLIENT: try
+    volumes:
+      - ./docker/ldap1/certs:/container/service/slapd/assets/certs
+    networks:
+      - ldapnet
+
+  ldap2:
+    image: osixia/openldap:1.5.0
+    hostname: ldap2
+    environment:
+      LDAP_ORGANISATION: Example
+      LDAP_DOMAIN: example.com
+      LDAP_BASE_DN: dc=example,dc=com
+      LDAP_ADMIN_PASSWORD: secret
+      # LDAPS configuration (same as ldap1)
+      LDAP_TLS: "true"
+      LDAP_TLS_CRT_FILENAME: ldap2.crt
+      LDAP_TLS_KEY_FILENAME: ldap2.key
+      LDAP_TLS_CA_CRT_FILENAME: ca.crt
+      LDAP_TLS_VERIFY_CLIENT: try
+    volumes:
+      - ./docker/ldap2/certs:/container/service/slapd/assets/certs
+    networks:
+      - ldapnet
+
+  ldap-load-balancer:
+    build: .
+    hostname: ldap-lb
+    ports:
+      - "1389:1389"
+      - "9090:9090"   # Prometheus metrics
+    # Конфигурация из etcd (ключ /ldap-load-balancer/config) с live reload.
+    # etcd должен быть в сети ldapnet (networks: - ldapnet), иначе имя etcd не резолвится.
+    # Записать конфиг в etcd: docker compose exec etcd etcdctl put /ldap-load-balancer/config "$(cat config.docker.yaml)"
+    # При запуске бинарника на хосте (cargo run): ETCD_ENDPOINTS=http://127.0.0.1:12379 или --etcd-endpoints-local
+    command:
+      - "--etcd-endpoints=http://etcd:2379"
+      - "--etcd-config-key=/ldap-load-balancer/config"
+      - "--etcd-fallback-file=/etc/ldap-lb/config.yaml"
+    volumes:
+      - ./config.docker.yaml:/etc/ldap-lb/config.yaml:ro
+    depends_on:
+      etcd:
+        condition: service_healthy
+      ldap1:
+        condition: service_started
+      ldap2:
+        condition: service_started
+    networks:
+      - ldapnet
+
+  # Несколько «подобных» клиентов без Kubernetes: docker compose up -d --scale ldap-client=5
+  ldap-client:
+    build:
+      context: ./docker/ldap-client
+    # hostname не задаём при scale — у каждого контейнера будет ldap-client-1, ldap-client-2, ...
+    depends_on:
+      ldap-load-balancer:
+        condition: service_started
+    environment:
+      LDAP_HOST: ldap-load-balancer
+      LDAP_PORT: "1389"
+    networks:
+      - ldapnet
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    hostname: prometheus
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    depends_on:
+      - ldap-load-balancer
+    networks:
+      - ldapnet
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    hostname: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://localhost:3000
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - ldapnet
+
+networks:
+  ldapnet:
+    driver: bridge

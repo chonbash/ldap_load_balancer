@@ -1,0 +1,40 @@
+[package]
+name = "ldap-load-balancer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "LDAP v3 load balancer for distributing requests across multiple LDAP servers"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+ldap3 = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+clap = { version = "4.4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+thiserror = "1.0"
+async-trait = "0.1"
+dashmap = "5.5"
+rustls = "0.23"
+rustls-pemfile = "2.0"
+rustls-pki-types = "1.14"
+tokio-rustls = "0.26"
+rustls-native-certs = "0.7"
+native-tls = "0.2"
+url = "2.5"
+rand = "0.8"
+arc-swap = "=1.6"
+etcd-client = "0.18"
+asn1-rs = "0.5"
+nom = "7.1"
+bytes = "1.5"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockall = "0.12"
+tempfile = "3.8"
+

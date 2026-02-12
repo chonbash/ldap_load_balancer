@@ -1,0 +1,16 @@
+# Режим разработки: код монтируется в контейнер, target в volume — правки без пересборки образа.
+# Запуск: docker compose -f docker-compose.yml -f docker-compose.dev.yml up ldap-load-balancer
+
+services:
+  ldap-load-balancer:
+    build:
+      context: .
+      target: builder
+    volumes:
+      - .:/app
+      - lb-target:/app/target
+      - ./config.docker.yaml:/etc/ldap-lb/config.yaml:ro
+    command: sh -c "cargo build --release && /app/target/release/ldap-load-balancer --config /etc/ldap-lb/config.yaml"
+
+volumes:
+  lb-target:

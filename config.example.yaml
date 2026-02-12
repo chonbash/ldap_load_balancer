@@ -1,0 +1,58 @@
+listen:
+  url: "ldap://:1389"
+
+backend:
+  # strategy: random | round_robin | ring_hash (default: random)
+  # ring_hash_vnodes: 100   # for ring_hash, virtual nodes per server
+
+  bind:
+    method: "simple"
+    binddn: "cn=admin,dc=example,dc=com"
+    credentials: "secret"
+    network_timeout: 5
+    tls_cacert: "/usr/local/etc/openldap/ca.crt"
+    tls_cert: "/usr/local/etc/openldap/host.crt"
+    tls_key: "/usr/local/etc/openldap/host.pem"
+  
+  servers:
+    - uri: "ldap://ldaphost01:389"
+      starttls: "critical"
+      retry: 5000
+      max_pending_ops: 50
+      conn_max_pending: 10
+      numconns: 10
+      bindconns: 5
+    
+    - uri: "ldap://ldaphost02:389"
+      starttls: "critical"
+      retry: 5000
+      max_pending_ops: 50
+      conn_max_pending: 10
+      numconns: 10
+      bindconns: 5
+    
+    - uri: "ldap://ldaphost03:389"
+      starttls: "critical"
+      retry: 5000
+      max_pending_ops: 50
+      conn_max_pending: 10
+      numconns: 10
+      bindconns: 5
+    
+    - uri: "ldap://ldaphost04:389"
+      starttls: "critical"
+      retry: 5000
+      max_pending_ops: 50
+      conn_max_pending: 10
+      numconns: 10
+      bindconns: 5
+
+tls:
+  cert_file: "/usr/local/etc/openldap/cert.pem"
+  key_file: "/usr/local/etc/openldap/key.pem"
+  ca_file: "/usr/local/etc/openldap/ca.pem"
+  share_slapd_ctx: true
+
+io_threads: 2
+proxyauthz: false
+

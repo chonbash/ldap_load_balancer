@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock
+*.log
+*.yaml.bak
+config.yaml
+.env
+.idea
+.vscode
+
