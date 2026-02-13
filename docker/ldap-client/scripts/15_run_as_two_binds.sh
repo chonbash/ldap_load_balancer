@@ -6,8 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log_msg "Run as: admin bind + search, then user bind + search (user reads own entry)"
 ldapsearch -x -H "$LDAP_URI" -D "$BIND_DN" -w "$BIND_PW" \
-  -b "$BASE_DN" -s one "(objectclass=*)" dn
+  -b "$BASE_DN" -s one "(objectclass=*)" dn > /dev/null
 # Пользователь по умолчанию может читать только свою запись
 ldapsearch -x -H "$LDAP_URI" -D "$TEST_USER_DN" -w "$TEST_USER_PW" \
-  -b "$TEST_USER_DN" -s base "(objectclass=*)" dn
+  -b "$TEST_USER_DN" -s base "(objectclass=*)" dn > /dev/null
 log_ok

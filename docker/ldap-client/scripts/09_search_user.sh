@@ -6,5 +6,5 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log_msg "Search user (getpwnam-like)"
 ldapsearch -x -H "$LDAP_URI" -D "$BIND_DN" -w "$BIND_PW" \
-  -b "$BASE_DN" -s sub "(|(uid=${TEST_USER_CN})(cn=${TEST_USER_CN}))" dn uid cn sn
+  -b "$BASE_DN" -s sub "(|(uid=${TEST_USER_CN})(cn=${TEST_USER_CN}))" dn uid cn sn > /dev/null
 log_ok

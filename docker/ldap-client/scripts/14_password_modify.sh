@@ -9,5 +9,5 @@ log_msg "Password modify (set same password to verify operation)"
 ldappasswd -x -H "$LDAP_URI" -D "$BIND_DN" -w "$BIND_PW" \
   -S "$TEST_USER_DN" -s "$TEST_USER_PW"
 # Проверяем, что bind пользователем по-прежнему работает
-ldapwhoami -x -H "$LDAP_URI" -D "$TEST_USER_DN" -w "$TEST_USER_PW"
+ldapwhoami -x -H "$LDAP_URI" -D "$TEST_USER_DN" -w "$TEST_USER_PW" > /dev/null
 log_ok

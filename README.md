@@ -38,6 +38,7 @@ backend:
   # Стратегия выбора backend: random (по умолчанию), round_robin, ring_hash
   # ring_hash — consistent hashing по адресу клиента (все запросы с одного клиента на один backend)
   strategy: random  # или round_robin, ring_hash
+  # sticky_writes: true  # по умолчанию true — после Bind операции записи (Add/Modify/Delete/ModifyDN) идут на тот же backend; в proxy-режиме одно соединение на клиента уже даёт sticky
   # Для ring_hash: число виртуальных узлов на сервер (по умолчанию 100)
   # ring_hash_vnodes: 100
   # Повтор подключения к backend при proxy: число попыток (default 3), задержка между попытками в ms (default 50)
@@ -56,7 +57,7 @@ backend:
   servers:
     - uri: "ldap://ldaphost01:389"
       starttls: "critical"
-      retry: 5000
+      retry: 5
       max_pending_ops: 50
       conn_max_pending: 10
       numconns: 10
@@ -64,7 +65,7 @@ backend:
     
     - uri: "ldap://ldaphost02:389"
       starttls: "critical"
-      retry: 5000
+      retry: 5
       max_pending_ops: 50
       conn_max_pending: 10
       numconns: 10
@@ -72,7 +73,7 @@ backend:
     
     - uri: "ldap://ldaphost03:389"
       starttls: "critical"
-      retry: 5000
+      retry: 5
       max_pending_ops: 50
       conn_max_pending: 10
       numconns: 10
@@ -104,7 +105,8 @@ proxyauthz: false
 | `ldap_lb_errors_total{op="..."}` | counter | Ошибки по типу операции (Errors) |
 | `ldap_lb_request_duration_seconds` | histogram | Длительность обработки запросов по операциям (Duration): `_bucket`, `_sum`, `_count` |
 | `ldap_lb_backend_servers` | gauge | Текущее число backend-серверов (из конфига) |
-| `ldap_lb_backend_up{uri="..."}` | gauge | Состояние узла в балансировке: 1 = up (healthy), 0 = down (по результатам health check) |
+| `ldap_lb_backend_up{uri="..."}` | gauge | Состояние узла: 1 = up, 0 = down, -1 = unknown (health check отключён) |
+| `ldap_lb_backend_requests_total{uri="...", op="..."}` | counter | Запросы, пересланные на каждый backend по типу операции (proxy-режим) |
 
 Пример конфигурации и запроса:
 
@@ -206,7 +208,7 @@ docker compose down
 
 Сервисы:
 - **etcd** — порт 12379 на хосте (в сети контейнеров: etcd:2379)
-- **ldap1**, **ldap2** — backend LDAP (OpenLDAP; для реального Samba AD нужен другой образ)
+- **ldap1**, **ldap2**, **ldap3** — backend LDAP (OpenLDAP; для реального Samba AD нужен другой образ)
 - **ldap-load-balancer** — порт 1389
 - **ldap-client** — контейнер с `ldapsearch`/`ldapwhoami` для проверки запросов
 

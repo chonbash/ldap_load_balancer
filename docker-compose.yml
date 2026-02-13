@@ -54,6 +54,24 @@ services:
     networks:
       - ldapnet
 
+  ldap3:
+    image: osixia/openldap:1.5.0
+    hostname: ldap3
+    environment:
+      LDAP_ORGANISATION: Example
+      LDAP_DOMAIN: example.com
+      LDAP_BASE_DN: dc=example,dc=com
+      LDAP_ADMIN_PASSWORD: secret
+      LDAP_TLS: "true"
+      LDAP_TLS_CRT_FILENAME: ldap3.crt
+      LDAP_TLS_KEY_FILENAME: ldap3.key
+      LDAP_TLS_CA_CRT_FILENAME: ca.crt
+      LDAP_TLS_VERIFY_CLIENT: try
+    volumes:
+      - ./docker/ldap3/certs:/container/service/slapd/assets/certs
+    networks:
+      - ldapnet
+
   ldap-load-balancer:
     build: .
     hostname: ldap-lb
@@ -76,6 +94,8 @@ services:
       ldap1:
         condition: service_started
       ldap2:
+        condition: service_started
+      ldap3:
         condition: service_started
     networks:
       - ldapnet

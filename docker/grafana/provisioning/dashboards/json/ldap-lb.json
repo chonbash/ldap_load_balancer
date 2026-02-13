@@ -69,8 +69,22 @@
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
       "id": 5,
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "targets": [{ "datasource": { "type": "Prometheus" }, "expr": "sum(rate(ldap_lb_errors_total[5m]))", "refId": "A" }],
+      "targets": [{ "datasource": { "type": "Prometheus" }, "expr": "sum(rate(ldap_lb_errors_total[5m])) + sum(rate(ldap_lb_parse_errors_total[5m]))", "refId": "A" }],
       "title": "Error rate (err/s)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "Prometheus" },
+      "description": "LDAP message parse errors (invalid BER) per second",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.001 }] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 24, "y": 1 },
+      "id": 15,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "datasource": { "type": "Prometheus" }, "expr": "sum(rate(ldap_lb_parse_errors_total[5m]))", "refId": "A" }],
+      "title": "Parse errors/s",
       "type": "stat"
     },
     {
@@ -149,6 +163,28 @@
       "options": { "legend": { "calcs": ["mean", "max", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true } },
       "targets": [{ "datasource": { "type": "Prometheus" }, "expr": "histogram_quantile(0.99, sum by (op, le) (rate(ldap_lb_request_duration_seconds_bucket[5m])))", "legendFormat": "p99 {{op}}", "refId": "A" }],
       "title": "Latency p99 by operation",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "id": 13,
+      "panels": [],
+      "title": "Backend request rate",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "Prometheus" },
+      "description": "Request rate per backend (proxy mode)",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showFrom": "auto", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 33 },
+      "id": 14,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true } },
+      "targets": [{ "datasource": { "type": "Prometheus" }, "expr": "sum by (uri) (rate(ldap_lb_backend_requests_total[5m]))", "legendFormat": "{{uri}}", "refId": "A" }],
+      "title": "Request rate by backend",
       "type": "timeseries"
     }
   ],

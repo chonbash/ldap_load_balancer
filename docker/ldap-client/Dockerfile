@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-ldap \
     python3-pyasn1 \
     python3-pyasn1-modules \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/ /scripts/

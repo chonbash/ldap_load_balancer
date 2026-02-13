@@ -3,6 +3,8 @@ listen:
 
 backend:
   # strategy: random | round_robin | ring_hash (default: random)
+  # sticky_writes: true   # default true — write ops after Bind use same backend (proxy keeps one connection per client)
+  # health_check: whoami   # whoami (default) | bind | tcp
   # ring_hash_vnodes: 100   # for ring_hash, virtual nodes per server
 
   bind:

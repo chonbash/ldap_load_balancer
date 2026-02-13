@@ -38,10 +38,12 @@ pub struct BackendConfig {
     pub strategy: BalanceStrategy,
     /// Number of virtual nodes per server for ring_hash (default 100).
     pub ring_hash_vnodes: Option<u32>,
-    /// Health check interval in seconds (default 10). Set to 0 to disable.
+    /// Health check interval in seconds (default 10). Set to 0 to disable (backend_up metric will show -1 = unknown).
     pub health_check_interval_sec: Option<u64>,
     /// Health check timeout in seconds (default 3).
     pub health_check_timeout_sec: Option<u64>,
+    /// Health check type: whoami (default), bind (simple bind with backend credentials), tcp (connect only).
+    pub health_check: Option<String>,
     /// Число попыток подключения к backend при proxy (default 3). При каждой попытке вызывается выбор узла заново (для random/round_robin — другой узел).
     pub connect_attempts: Option<u32>,
     /// Задержка между попытками подключения в миллисекундах (default 50).
@@ -50,6 +52,8 @@ pub struct BackendConfig {
     pub tls_skip_verify: Option<bool>,
     /// При конфиге из etcd: ключ с PEM CA или бандла для проверки сертификатов ldaps:// бэкендов.
     pub tls_ca_etcd_key: Option<String>,
+    /// When true, write operations (Add/Modify/Delete/ModifyDN) after Bind use the same backend as the Bind (sticky session). In proxy mode one backend stream per connection already provides this; option is for explicit configuration and documentation. Default true.
+    pub sticky_writes: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,11 +126,13 @@ impl Default for Config {
                 ring_hash_vnodes: None,
                 health_check_interval_sec: Some(10),
                 health_check_timeout_sec: Some(3),
+                health_check: Some("whoami".to_string()),
                 connect_attempts: None,
-                connect_retry_delay_ms: None,
-                tls_skip_verify: None,
-                tls_ca_etcd_key: None,
-            },
+            connect_retry_delay_ms: None,
+            tls_skip_verify: None,
+            tls_ca_etcd_key: None,
+            sticky_writes: Some(true),
+        },
             tls: None,
             io_threads: Some(1),
             proxyauthz: Some(false),

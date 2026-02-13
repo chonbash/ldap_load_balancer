@@ -28,10 +28,12 @@ fn dummy_backend_config() -> BackendConfig {
         ring_hash_vnodes: None,
         health_check_interval_sec: Some(0),
         health_check_timeout_sec: Some(3),
+        health_check: Some("whoami".to_string()),
         connect_attempts: None,
         connect_retry_delay_ms: None,
         tls_skip_verify: None,
         tls_ca_etcd_key: None,
+        sticky_writes: Some(true),
         servers: vec![BackendServer {
             uri: "ldap://127.0.0.1:1".to_string(),
             starttls: None,

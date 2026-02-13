@@ -5,6 +5,11 @@ listen:
 metrics_listen: "0.0.0.0:9090"
 
 backend:
+  strategy: round_robin
+  health_check: whoami
+  sticky_writes: true
+  ring_hash_vnodes: 3
+
   bind:
     method: "simple"
     binddn: "cn=admin,dc=example,dc=com"
@@ -12,11 +17,15 @@ backend:
     network_timeout: 5
   servers:
     - uri: "ldap://ldap1:389"
-      retry: 5000
+      retry: 5
       numconns: 5
       bindconns: 2
     - uri: "ldap://ldap2:389"
-      retry: 5000
+      retry: 5
+      numconns: 5
+      bindconns: 2
+    - uri: "ldap://ldap3:389"
+      retry: 5
       numconns: 5
       bindconns: 2
 

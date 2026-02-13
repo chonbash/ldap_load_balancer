@@ -6,5 +6,5 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log_msg "Search policies (GPO-like: read base/system)"
 ldapsearch -x -H "$LDAP_URI" -D "$BIND_DN" -w "$BIND_PW" \
-  -b "$BASE_DN" -s base "(objectclass=*)" dn objectClass o
+  -b "$BASE_DN" -s base "(objectclass=*)" dn objectClass o > /dev/null
 log_ok

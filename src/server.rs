@@ -1,4 +1,4 @@
-use crate::backend::{BackendConnection, BackendStream};
+use crate::backend::{BackendConnection, BackendSession, BackendStream};
 use crate::ldap_handler::{LdapHandler, PersistentSearchItem};
 use crate::metrics::Metrics;
 use crate::ldap_protocol::{
@@ -263,7 +263,7 @@ async fn handle_client(
     tls_acceptor: Option<Arc<ArcSwap<TlsAcceptor>>>,
 ) -> Result<()> {
     debug!("Handling client connection from {}", peer_addr);
-    let mut backend_stream: Option<BackendStream> = None;
+    let mut backend_session: Option<BackendSession> = None;
     let mut backend_read_buf = BytesMut::with_capacity(4096);
     let mut buffer = BytesMut::with_capacity(4096);
 
@@ -304,6 +304,12 @@ async fn handle_client(
                             response_tag,
                             consume,
                         } => {
+                            metrics.inc_parse_error();
+                            let first_byte = buffer.get(0).copied().unwrap_or(0);
+                            debug!(
+                                "Parse error from {} (first_byte=0x{:02X}, consume={}); sending protocolError",
+                                peer_addr, first_byte, consume,
+                            );
                             let err_data = encode_error_response(
                                 message_id,
                                 response_tag,
@@ -335,13 +341,19 @@ async fn handle_client(
                             let metric_op = metric_op_name(&message.protocol_op);
                             let start = Instant::now();
 
+                            // AbandonRequest: no response per RFC 4511
+                            if let ProtocolOp::AbandonRequest(to_abandon) = message.protocol_op {
+                                debug!("Abandon request for msgid {} (ignored)", to_abandon);
+                                continue;
+                            }
+
                             if let ProtocolOp::SearchRequest(ref search_req) = message.protocol_op {
                                 if let Some(sync_ctrl) = get_sync_request_control(message.controls.as_ref().map(|v| v.as_slice())) {
                                     if sync_ctrl.is_refresh_and_persist() {
                                         let message_id = message.message_id;
                                         let base = search_req.base_object.clone();
                                         let scope = scope_to_ldap3(search_req.scope);
-                                        let filter = search_req.filter.clone();
+                                        let filter = search_req.filter.to_ldap_string();
                                         let attrs = search_req.attributes.clone();
                                         let cookie = sync_ctrl.cookie.clone();
                                         let session_key = Some(peer_addr.to_string().into_bytes());
@@ -484,7 +496,7 @@ async fn handle_client(
 
                             // Proxy: forward request bytes to backend, forward response bytes to client unchanged
                             let pool = handler.live_config.backend_pool();
-                            let backend = if let Some(s) = &mut backend_stream {
+                            let session = if let Some(s) = &mut backend_session {
                                 s
                             } else {
                                 let cfg = handler.live_config.config();
@@ -500,7 +512,7 @@ async fn handle_client(
                                     {
                                         Ok(s) => {
                                             debug!("Backend connection opened for {} (proxy)", peer_addr);
-                                            backend_stream = Some(s);
+                                            backend_session = Some(s);
                                             last_err = None;
                                             break;
                                         }
@@ -513,8 +525,8 @@ async fn handle_client(
                                         }
                                     }
                                 }
-                                if backend_stream.is_some() {
-                                    backend_stream.as_mut().unwrap()
+                                if backend_session.is_some() {
+                                    backend_session.as_mut().unwrap()
                                 } else {
                                     if let Some(op) = metric_op {
                                         metrics.observe_duration(op, start.elapsed());
@@ -522,9 +534,10 @@ async fn handle_client(
                                     return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No backend")));
                                 }
                             };
+                            let backend_uri = session.uri.clone();
                             let op_name = proxy_op_name(&message.protocol_op);
                             debug!("Proxy: {} (msgid {}) from {}", op_name, message.message_id, peer_addr);
-                            if let Err(e) = backend.write_all(&mwr.raw).await {
+                            if let Err(e) = session.stream.write_all(&mwr.raw).await {
                                 error!("Failed to forward request to backend {}: {}", peer_addr, e);
                                 if let Some(op) = metric_op {
                                     metrics.inc_error(op);
@@ -532,10 +545,10 @@ async fn handle_client(
                                 break;
                             }
                             if let ProtocolOp::UnbindRequest = message.protocol_op {
-                                backend_stream = None;
+                                backend_session = None;
                             } else {
                                 loop {
-                                    let resp = match read_one_ldap_message(backend, &mut backend_read_buf).await {
+                                    let resp = match read_one_ldap_message(&mut session.stream, &mut backend_read_buf).await {
                                         Ok(r) => r,
                                         Err(e) => {
                                             error!("Failed to read response from backend {}: {}", peer_addr, e);
@@ -568,6 +581,7 @@ async fn handle_client(
                             if let Some(op) = metric_op {
                                 metrics.observe_duration(op, start.elapsed());
                                 metrics.inc_request(op);
+                                metrics.inc_backend_request(&backend_uri, op);
                             }
                         }
                     }
@@ -659,9 +673,16 @@ async fn run_persistent_search_loop(
                             let _ = read_buffer.split_to(consume);
                         }
                         TryParseResult::Message(mwr) => {
-                            if let ProtocolOp::UnbindRequest = mwr.message.protocol_op {
-                                debug!("Persistent search: client sent Unbind");
-                                return Ok(());
+                            match mwr.message.protocol_op {
+                                ProtocolOp::UnbindRequest => {
+                                    debug!("Persistent search: client sent Unbind");
+                                    return Ok(());
+                                }
+                                ProtocolOp::AbandonRequest(to_abandon) => {
+                                    debug!("Persistent search: client sent Abandon for msgid {} (ignored)", to_abandon);
+                                    // No response per RFC 4511; continue receiving
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -684,6 +705,7 @@ fn proxy_op_name(op: &ProtocolOp) -> &'static str {
         ProtocolOp::CompareRequest(_) => "COMPARE",
         ProtocolOp::ExtendedRequest(_) => "EXTENDED",
         ProtocolOp::UnbindRequest => "UNBIND",
+        ProtocolOp::AbandonRequest(_) => "ABANDON",
         _ => "OP",
     }
 }
@@ -700,6 +722,7 @@ fn metric_op_name(op: &ProtocolOp) -> Option<&'static str> {
         ProtocolOp::CompareRequest(_) => Some("compare"),
         ProtocolOp::ExtendedRequest(_) => Some("extended"),
         ProtocolOp::UnbindRequest => None,
+        ProtocolOp::AbandonRequest(_) => None,
         _ => Some("other"),
     }
 }
@@ -778,15 +801,86 @@ fn response_tag_for_protocol_op(op: &ProtocolOp) -> Option<u8> {
         ProtocolOp::CompareRequest(_) => Some(LDAP_TAG_COMPARE_RESPONSE),
         ProtocolOp::ExtendedRequest(_) => Some(LDAP_TAG_EXTENDED_RESPONSE),
         ProtocolOp::UnbindRequest => None,
+        ProtocolOp::AbandonRequest(_) => None,
         _ => Some(LDAP_TAG_BIND_RESPONSE), // fallback for any other (shouldn't be request types)
     }
 }
+
+/// Top-level LDAP message is always a SEQUENCE (BER tag 0x30). If the stream
+/// starts with another tag (e.g. 0x04 OCTET STRING), we're either seeing
+/// invalid client data or the remainder of a message after a framing error.
+const LDAP_MESSAGE_SEQUENCE_TAG: u8 = 0x30;
 
 fn try_parse_message(buffer: &mut BytesMut) -> Result<TryParseResult> {
     if buffer.len() < 2 {
         return Ok(TryParseResult::Incomplete);
     }
-    
+
+    let first_byte = buffer[0];
+    // Unwrap OCTET STRING–wrapped LDAP: some clients send 0x04 <len> <LDAP message (0x30...)>.
+    if first_byte == 0x04 && buffer.len() >= 2 {
+        let len_byte = buffer[1];
+        let outer_inner = if (len_byte & 0x80) == 0 {
+            let content_len = len_byte as usize;
+            Some((2 + content_len, 2usize))
+        } else {
+            let length_bytes = (len_byte & 0x7F) as usize;
+            if length_bytes == 0 || length_bytes > 4 {
+                None
+            } else if buffer.len() < 2 + length_bytes {
+                return Ok(TryParseResult::Incomplete);
+            } else {
+                let mut content_len = 0usize;
+                for i in 0..length_bytes {
+                    content_len = (content_len << 8) | buffer[2 + i] as usize;
+                }
+                let start = 2 + length_bytes;
+                Some((start + content_len, start))
+            }
+        };
+        if let Some((outer_total, inner_start)) = outer_inner {
+            if buffer.len() >= outer_total {
+                let inner = &buffer[inner_start..outer_total];
+                match parse_ldap_message(inner) {
+                    Ok(msg) => {
+                        let raw = inner.to_vec();
+                        let _ = buffer.split_to(outer_total);
+                        return Ok(TryParseResult::Message(MessageWithRaw { message: msg, raw }));
+                    }
+                    Err(e) => {
+                        let hex_preview: String = inner
+                            .iter()
+                            .take(64)
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        warn!(
+                            "Failed to parse 0x04-wrapped LDAP message: {} (inner first 64 bytes: {})",
+                            e, hex_preview
+                        );
+                    }
+                }
+                // Inner is not valid LDAP; consume whole TLV and report one error
+                let (message_id, request_tag) = parse_ldap_message_header(inner).unwrap_or((0, 0x60));
+                let response_tag = response_tag_for_request(request_tag);
+                let _ = buffer.split_to(outer_total);
+                return Ok(TryParseResult::ParseError {
+                    message_id,
+                    response_tag,
+                    consume: outer_total,
+                });
+            }
+            return Ok(TryParseResult::Incomplete);
+        }
+    }
+    if first_byte != LDAP_MESSAGE_SEQUENCE_TAG {
+        return Ok(TryParseResult::ParseError {
+            message_id: 0,
+            response_tag: LDAP_TAG_BIND_RESPONSE,
+            consume: 1,
+        });
+    }
+
     // Check if we have at least the tag and length
     let mut cursor = std::io::Cursor::new(&buffer[..]);
     let mut tag_buf = [0u8; 1];
@@ -832,7 +926,16 @@ fn try_parse_message(buffer: &mut BytesMut) -> Result<TryParseResult> {
             Ok(TryParseResult::Message(MessageWithRaw { message: msg, raw }))
         }
         Err(e) => {
-            warn!("Failed to parse LDAP message: {}", e);
+            let hex_preview: String = slice
+                .iter()
+                .take(64)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            warn!(
+                "Failed to parse LDAP message: {} (first 64 bytes: {})",
+                e, hex_preview
+            );
             let (message_id, request_tag) = parse_ldap_message_header(slice).unwrap_or((0, 0x60));
             let response_tag = response_tag_for_request(request_tag);
             Ok(TryParseResult::ParseError {
@@ -910,7 +1013,7 @@ async fn process_ldap_message(
         
         ProtocolOp::SearchRequest(search_req) => {
             debug!("Processing SEARCH request: base={}, filter={}", 
-                   search_req.base_object, search_req.filter);
+                   search_req.base_object, search_req.filter.to_ldap_string());
             
             let scope = scope_to_ldap3(search_req.scope);
             let attrs: Vec<&str> = search_req.attributes.iter().map(|s| s.as_str()).collect();
@@ -918,7 +1021,7 @@ async fn process_ldap_message(
             let search_result = handler.handle_search(
                 &search_req.base_object,
                 scope,
-                &search_req.filter,
+                &search_req.filter.to_ldap_string(),
                 attrs,
                 Some(session_key.as_slice()),
                 session_conn.as_mut(),

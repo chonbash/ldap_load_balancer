@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::TlsConnector;
 use rustls::client::ClientConfig;
-use rustls::client::danger::{DangerousClientConfig, HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::SignatureScheme;
 use rustls_pki_types::ServerName;
 
@@ -198,6 +198,8 @@ struct BackendServerInfo {
     bindconns: u32,
     state: Arc<AtomicU8>,
     pool: Arc<ConnPoolState>,
+    /// "whoami" | "bind" | "tcp"
+    health_check_kind: String,
 }
 
 impl std::fmt::Debug for BackendPool {
@@ -215,12 +217,22 @@ impl BackendPool {
     /// pass the fetched CA PEM as `backend_ca_pem` for ldaps backend verification.
     pub fn new(config: BackendConfig, backend_ca_pem: Option<Vec<u8>>) -> Result<Self> {
         let bind_config = config.bind.clone();
+        let health_interval_sec = config.health_check_interval_sec.unwrap_or(10);
+        let health_timeout_sec = config.health_check_timeout_sec.unwrap_or(3);
+        let health_check = config
+            .health_check
+            .as_deref()
+            .unwrap_or("whoami")
+            .to_lowercase();
+        let tls_skip_verify = config.tls_skip_verify.unwrap_or(false);
+        let backend_ca_pem = backend_ca_pem.map(Arc::new);
+
         let servers: Vec<BackendServerInfo> = config
             .servers
             .iter()
             .enumerate()
             .map(|(idx, server)| {
-                BackendServerInfo::new(idx, server.clone(), bind_config.clone())
+                BackendServerInfo::new(idx, server.clone(), bind_config.clone(), &health_check)
             })
             .collect();
 
@@ -239,11 +251,6 @@ impl BackendPool {
             config.ring_hash_vnodes.unwrap_or(100),
             strategy,
         );
-
-        let health_interval_sec = config.health_check_interval_sec.unwrap_or(10);
-        let health_timeout_sec = config.health_check_timeout_sec.unwrap_or(3);
-        let tls_skip_verify = config.tls_skip_verify.unwrap_or(false);
-        let backend_ca_pem = backend_ca_pem.map(Arc::new);
 
         Ok(Self {
             servers: Arc::new(servers),
@@ -293,7 +300,7 @@ impl BackendPool {
         &self,
         hash_key: Option<&[u8]>,
         indices: Vec<usize>,
-        n: usize,
+        _n: usize,
         is_up: impl Fn(usize) -> bool,
     ) -> Result<usize> {
         match self.strategy {
@@ -366,18 +373,22 @@ impl BackendPool {
         self.servers.len()
     }
 
-    /// Текущее состояние узлов для мониторинга: (uri, is_up). Соответствует данным health check.
-    pub fn backend_states(&self) -> Vec<(String, bool)> {
+    /// Текущее состояние узлов для мониторинга: (uri, Some(is_up)) когда health check включён, (uri, None) когда отключён (interval 0).
+    pub fn backend_states(&self) -> Vec<(String, Option<bool>)> {
+        let unknown = self.health_interval_sec == 0;
         self.servers
             .iter()
-            .map(|s| (s.uri.clone(), s.state.load(Ordering::Relaxed) == NODE_UP))
+            .map(|s| {
+                let up = s.state.load(Ordering::Relaxed) == NODE_UP;
+                (s.uri.clone(), if unknown { None } else { Some(up) })
+            })
             .collect()
     }
 
     /// Open a raw stream to the selected backend (TCP for ldap://, TLS for ldaps://).
     /// Does not use the connection pool; one stream per client session.
     /// If all backends are marked down by health check, tries anyway (fallback) and marks server up on success.
-    pub async fn open_raw_stream(&self, hash_key: Option<&[u8]>) -> Result<BackendStream> {
+    pub async fn open_raw_stream(&self, hash_key: Option<&[u8]>) -> Result<BackendSession> {
         let server_idx = self.select_server_index(hash_key)
             .or_else(|e| {
                 if e.to_string().contains("No healthy backend servers available") {
@@ -418,8 +429,17 @@ impl BackendPool {
             server.state.store(NODE_UP, Ordering::Relaxed);
             info!("Backend {} marked up after successful raw connect", server.uri);
         }
-        Ok(stream)
+        Ok(BackendSession {
+            stream,
+            uri: server.uri.clone(),
+        })
     }
+}
+
+/// Backend connection with URI for metrics (per-backend request counts).
+pub struct BackendSession {
+    pub stream: BackendStream,
+    pub uri: String,
 }
 
 /// Stream to backend: plain TCP (ldap://) or TLS (ldaps://).
@@ -526,6 +546,7 @@ fn tls_client_config_insecure() -> Result<Arc<ClientConfig>> {
 }
 
 /// Build default TLS client config with system root certificates (for connecting to ldaps:// backends).
+#[allow(dead_code)]
 fn default_tls_client_config() -> Result<Arc<ClientConfig>> {
     default_tls_client_config_with_ca(None)
 }
@@ -592,7 +613,7 @@ impl Drop for BackendConnection {
 }
 
 impl BackendServerInfo {
-    fn new(_idx: usize, server: BackendServer, bind_config: BindConfig) -> Self {
+    fn new(_idx: usize, server: BackendServer, bind_config: BindConfig, health_check_kind: &str) -> Self {
         let uri = server.uri.clone();
         let pool = Arc::new(ConnPoolState {
             uri: uri.clone(),
@@ -614,28 +635,63 @@ impl BackendServerInfo {
             bindconns: server.bindconns.unwrap_or(5),
             state: Arc::new(AtomicU8::new(NODE_UP)),
             pool,
+            health_check_kind: health_check_kind.to_string(),
         }
     }
 
     /// Returns Ok(true) if healthy, Ok(false) or Err if down.
     async fn check_health(&self, timeout_sec: u64) -> Result<bool> {
         let timeout = Duration::from_secs(timeout_sec);
-        let mut conn = match tokio::time::timeout(
-            timeout,
-            ConnPoolState::create_connection(&self.uri),
-        )
-        .await
-        {
-            Ok(Ok(ldap)) => ldap,
-            _ => return Ok(false),
-        };
-        let ok = tokio::time::timeout(timeout, conn.extended(WhoAmI))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .and_then(|r| r.success().ok())
-            .is_some();
-        Ok(ok)
+        match self.health_check_kind.as_str() {
+            "tcp" => {
+                let (host, port) = parse_ldap_uri_to_host_port(&self.uri)?;
+                let addr = format!("{}:{}", host, port);
+                match tokio::time::timeout(timeout, TcpStream::connect(&addr)).await {
+                    Ok(Ok(_)) => Ok(true),
+                    _ => Ok(false),
+                }
+            }
+            "bind" => {
+                let mut conn = match tokio::time::timeout(
+                    timeout,
+                    ConnPoolState::create_connection(&self.uri),
+                )
+                .await
+                {
+                    Ok(Ok(ldap)) => ldap,
+                    _ => return Ok(false),
+                };
+                let (binddn, creds) = (
+                    self.pool.bind_config.binddn.as_deref().unwrap_or(""),
+                    self.pool.bind_config.credentials.as_deref().unwrap_or(""),
+                );
+                let ok = tokio::time::timeout(timeout, conn.simple_bind(binddn, creds))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .is_some();
+                Ok(ok)
+            }
+            _ => {
+                // whoami (default)
+                let mut conn = match tokio::time::timeout(
+                    timeout,
+                    ConnPoolState::create_connection(&self.uri),
+                )
+                .await
+                {
+                    Ok(Ok(ldap)) => ldap,
+                    _ => return Ok(false),
+                };
+                let ok = tokio::time::timeout(timeout, conn.extended(WhoAmI))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .and_then(|r| r.success().ok())
+                    .is_some();
+                Ok(ok)
+            }
+        }
     }
 
     async fn get_connection(&self) -> Result<Ldap> {
@@ -667,9 +723,12 @@ mod tests {
             ring_hash_vnodes: None,
             health_check_interval_sec: Some(10),
             health_check_timeout_sec: Some(3),
+            health_check: Some("whoami".to_string()),
             connect_attempts: None,
             connect_retry_delay_ms: None,
             tls_skip_verify: None,
+            tls_ca_etcd_key: None,
+            sticky_writes: None,
             servers: vec![
                 BackendServer {
                     uri: "ldap://localhost:389".to_string(),
@@ -716,9 +775,12 @@ mod tests {
             ring_hash_vnodes: None,
             health_check_interval_sec: None,
             health_check_timeout_sec: None,
+            health_check: None,
             connect_attempts: None,
             connect_retry_delay_ms: None,
             tls_skip_verify: None,
+            tls_ca_etcd_key: None,
+            sticky_writes: None,
             servers: vec![],
         };
         assert!(BackendPool::new(config, None).is_err());
@@ -751,7 +813,7 @@ mod tests {
             numconns: Some(15),
             bindconns: Some(8),
         };
-        let info = BackendServerInfo::new(0, server, bind_config);
+        let info = BackendServerInfo::new(0, server, bind_config, "whoami");
         assert_eq!(info.uri, "ldap://test:389");
         assert_eq!(info.starttls, Some("demand".to_string()));
         assert_eq!(info.retry_ms, 3000);
@@ -781,7 +843,7 @@ mod tests {
             numconns: None,
             bindconns: None,
         };
-        let info = BackendServerInfo::new(0, server, bind_config);
+        let info = BackendServerInfo::new(0, server, bind_config, "whoami");
         assert_eq!(info.retry_ms, 5000);
         assert_eq!(info.max_pending_ops, 50);
         assert_eq!(info.conn_max_pending, 10);
@@ -805,9 +867,12 @@ mod tests {
             ring_hash_vnodes: None,
             health_check_interval_sec: None,
             health_check_timeout_sec: None,
+            health_check: None,
             connect_attempts: None,
             connect_retry_delay_ms: None,
             tls_skip_verify: None,
+            tls_ca_etcd_key: None,
+            sticky_writes: None,
             servers: vec![
                 BackendServer {
                     uri: "ldap://localhost:389".to_string(),

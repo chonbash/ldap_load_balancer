@@ -60,6 +60,8 @@ pub enum ProtocolOp {
     IntermediateResponse(IntermediateResponse),
     UnbindRequest,
     UnbindResponse,
+    /// AbandonRequest: [APPLICATION 16] MessageID - no server response per RFC 4511
+    AbandonRequest(i32),
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +90,89 @@ pub struct BindResponse {
     pub diagnostic_message: String,
 }
 
+/// LDAP Search filter (RFC 4511). Can be converted to string for ldap3.
+#[derive(Debug, Clone)]
+pub enum Filter {
+    And(Vec<Filter>),
+    Or(Vec<Filter>),
+    Not(Box<Filter>),
+    EqualityMatch { attribute: String, value: Vec<u8> },
+    Substrings {
+        attribute: String,
+        substrings: Vec<SubstringFilterItem>,
+    },
+    GreaterOrEqual { attribute: String, value: Vec<u8> },
+    LessOrEqual { attribute: String, value: Vec<u8> },
+    Present(String),
+    ApproxMatch { attribute: String, value: Vec<u8> },
+    ExtensibleMatch {
+        matching_rule: Option<String>,
+        typ: Option<String>,
+        match_value: Vec<u8>,
+        dn_attributes: bool,
+    },
+    /// Unparsed or unknown filter (e.g. context-specific); stored as (tag, raw value).
+    Raw(u8, Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+pub enum SubstringFilterItem {
+    Initial(Vec<u8>),
+    Any(Vec<u8>),
+    Final(Vec<u8>),
+}
+
+impl Filter {
+    /// String form suitable for ldap3 search (e.g. "(cn=foo)", "(&(a=b)(c=d))").
+    pub fn to_ldap_string(&self) -> String {
+        match self {
+            Filter::And(fs) => format!("(&{})", fs.iter().map(Filter::to_ldap_string).collect::<String>()),
+            Filter::Or(fs) => format!("(|{})", fs.iter().map(Filter::to_ldap_string).collect::<String>()),
+            Filter::Not(f) => format!("(!{})", f.to_ldap_string()),
+            Filter::EqualityMatch { attribute, value } => {
+                let v = String::from_utf8_lossy(value);
+                let escaped = v.replace('\\', "\\\\").replace('*', "\\2a").replace('(', "\\28").replace(')', "\\29").replace('\x00', "\\00");
+                format!("({}={})", attribute, escaped)
+            }
+            Filter::Present(attr) => format!("({}=*)", attr),
+            Filter::Substrings { attribute, substrings } => {
+                let mut s = attribute.clone();
+                s.push('=');
+                for item in substrings {
+                    match item {
+                        SubstringFilterItem::Initial(b) => s.push_str(&String::from_utf8_lossy(b).replace('*', "\\2a")),
+                        SubstringFilterItem::Any(b) => {
+                            s.push('*');
+                            s.push_str(&String::from_utf8_lossy(b).replace('*', "\\2a"));
+                        }
+                        SubstringFilterItem::Final(b) => {
+                            s.push('*');
+                            s.push_str(&String::from_utf8_lossy(b).replace('*', "\\2a"));
+                        }
+                    }
+                }
+                format!("({})", s)
+            }
+            Filter::GreaterOrEqual { attribute, value } => format!("({}>={})", attribute, String::from_utf8_lossy(value)),
+            Filter::LessOrEqual { attribute, value } => format!("({}<={})", attribute, String::from_utf8_lossy(value)),
+            Filter::ApproxMatch { attribute, value } => format!("({}~={})", attribute, String::from_utf8_lossy(value)),
+            Filter::ExtensibleMatch { matching_rule, typ, match_value, .. } => {
+                let v = String::from_utf8_lossy(match_value);
+                let mut s = String::from(":=");
+                if let Some(mr) = matching_rule.as_ref() {
+                    s = format!(":{}:=", mr) + &v;
+                } else if let Some(t) = typ.as_ref() {
+                    s = format!(":dn:{}:=", t) + &v;
+                } else {
+                    s.push_str(&v);
+                }
+                format!("(:{})", s)
+            }
+            Filter::Raw(_, _) => "(objectClass=*)".to_string(), // fallback for raw
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
     pub base_object: String,
@@ -96,7 +181,7 @@ pub struct SearchRequest {
     pub size_limit: i32,
     pub time_limit: i32,
     pub types_only: bool,
-    pub filter: String,
+    pub filter: Filter,
     pub attributes: Vec<String>,
 }
 
@@ -245,10 +330,28 @@ impl<'a> BerReader<'a> {
         }
     }
 
+    /// Read single-byte tag. For multi-byte tags (tag number >= 31), use read_tag_multibyte().
     fn read_tag(&mut self) -> Result<u8> {
         let mut buf = [0u8; 1];
         self.cursor.read_exact(&mut buf)?;
         Ok(buf[0])
+    }
+
+    /// Read tag that may be multi-byte (X.690: high tag number). Returns full tag bytes (1 or more).
+    #[allow(dead_code)]
+    pub(crate) fn read_tag_multibyte(&mut self) -> Result<Vec<u8>> {
+        let first = self.read_tag()?;
+        let mut tag_bytes = vec![first];
+        if (first & 0x1F) == 0x1F {
+            loop {
+                let b = self.read_tag()?;
+                tag_bytes.push(b);
+                if (b & 0x80) == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(tag_bytes)
     }
 
     fn read_length(&mut self) -> Result<usize> {
@@ -308,11 +411,12 @@ impl<'a> BerReader<'a> {
         Ok(value)
     }
 
-    /// Read OCTET STRING TLV. Accepts: 0x04 (universal), 0x30 (SEQUENCE), or any context-specific tag 0x80..=0xBF.
+    /// Read OCTET STRING TLV. Accepts: 0x04 (universal), 0x08 (context, e.g. SASL mechanism), 0x30 (SEQUENCE), or context-specific 0x80..=0xBF.
     fn read_octet_string(&mut self) -> Result<Vec<u8>> {
         let tag = self.read_tag()?;
         let ok = (tag & 0x1F) == 0x04  // universal OCTET STRING
-            || tag == 0x30              // SEQUENCE (some clients use for DN etc.)
+            || (tag & 0x1F) == 0x08    // context (e.g. SASL mechanism in BindRequest)
+            || tag == 0x30             // SEQUENCE (some clients use for DN etc.)
             || (tag >= 0x80 && tag <= 0xBF); // context-specific [0]..[31]
         if !ok {
             bail!("Expected OCTET STRING tag (0x04), got: 0x{:02X}", tag);
@@ -391,6 +495,125 @@ impl<'a> BerReader<'a> {
         self.cursor.read_exact(&mut buf)?;
         Ok(buf)
     }
+
+    /// Read OID (Universal tag 6). Returns OID components as string "1.2.3.4".
+    #[allow(dead_code)]
+    pub(crate) fn read_oid(&mut self) -> Result<String> {
+        let tag = self.read_tag()?;
+        if (tag & 0x1F) != 0x06 {
+            bail!("Expected OID tag (0x06), got: 0x{:02X}", tag);
+        }
+        let length = self.read_length()?;
+        if self.remaining() < length {
+            bail!("BER truncated: OID needs {} bytes, {} remaining", length, self.remaining());
+        }
+        let bytes = self.read_raw_bytes(length)?;
+        oid_bytes_to_string(&bytes)
+    }
+
+    /// Read length, supporting indefinite form (0x80). Returns None for indefinite length.
+    #[allow(dead_code)]
+    pub(crate) fn read_length_or_indefinite(&mut self) -> Result<Option<usize>> {
+        let mut buf = [0u8; 1];
+        self.cursor.read_exact(&mut buf)?;
+        let first_byte = buf[0];
+        if (first_byte & 0x80) == 0 {
+            return Ok(Some(first_byte as usize));
+        }
+        if first_byte == 0x80 {
+            return Ok(None); // indefinite
+        }
+        let length_bytes = (first_byte & 0x7F) as usize;
+        if length_bytes > 4 {
+            bail!("Length too large: {} bytes", length_bytes);
+        }
+        if self.remaining() < length_bytes {
+            bail!("BER truncated: length encoding needs {} bytes, {} remaining", length_bytes, self.remaining());
+        }
+        let mut length = 0usize;
+        for _ in 0..length_bytes {
+            self.cursor.read_exact(&mut buf)?;
+            length = (length << 8) | buf[0] as usize;
+        }
+        Ok(Some(length))
+    }
+}
+
+/// Decode BER OID bytes to dotted string (e.g. "1.2.840.113549").
+#[allow(dead_code)]
+pub(crate) fn oid_bytes_to_string(bytes: &[u8]) -> Result<String> {
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    let mut components = Vec::new();
+    let mut val: u64 = 0;
+    for &b in bytes {
+        val = val
+            .checked_mul(128)
+            .and_then(|v| v.checked_add((b & 0x7F) as u64))
+            .ok_or_else(|| anyhow::anyhow!("OID value overflow"))?;
+        if (b & 0x80) == 0 {
+            components.push(val);
+            val = 0;
+        }
+    }
+    if (bytes.last().copied().unwrap_or(0) & 0x80) != 0 {
+        bail!("OID encoding truncated");
+    }
+    // First two components encoded as 40 * first + second
+    let mut parts = Vec::with_capacity(components.len() + 1);
+    if let Some(&first) = components.first() {
+        parts.push((first / 40).to_string());
+        parts.push((first % 40).to_string());
+        for &c in &components[1..] {
+            parts.push(c.to_string());
+        }
+    }
+    Ok(parts.join("."))
+}
+
+/// Encode OID string to BER bytes (e.g. "1.2.840" -> bytes).
+fn oid_string_to_bytes(oid: &str) -> Result<Vec<u8>> {
+    let components: Vec<u64> = oid
+        .split('.')
+        .map(|s| s.trim().parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| anyhow::anyhow!("Invalid OID component"))?;
+    if components.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    let first = components[0].min(6);
+    let second = components.get(1).copied().unwrap_or(0);
+    let mut val = first * 40 + second;
+    let mut buf = Vec::new();
+    loop {
+        buf.push((val % 128) as u8);
+        val /= 128;
+        if val == 0 {
+            break;
+        }
+    }
+    buf.reverse();
+    for (i, b) in buf.iter().enumerate() {
+        out.push(if i < buf.len() - 1 { *b | 0x80 } else { *b });
+    }
+    for &c in components.iter().skip(2) {
+        let mut val = c;
+        buf.clear();
+        loop {
+            buf.push((val % 128) as u8);
+            val /= 128;
+            if val == 0 {
+                break;
+            }
+        }
+        buf.reverse();
+        for (i, b) in buf.iter().enumerate() {
+            out.push(if i < buf.len() - 1 { *b | 0x80 } else { *b });
+        }
+    }
+    Ok(out)
 }
 
 // BER encoding utilities
@@ -407,6 +630,20 @@ impl BerWriter {
 
     pub fn write_tag(&mut self, tag: u8) {
         self.buffer.push(tag);
+    }
+
+    /// Write multi-byte tag (X.690 high tag number). `tag_bytes` must be 1 or more bytes.
+    pub fn write_tag_multi(&mut self, tag_bytes: &[u8]) {
+        self.buffer.extend_from_slice(tag_bytes);
+    }
+
+    /// Write OID (Universal 6) from dotted string (e.g. "1.2.840.113549").
+    pub fn write_oid(&mut self, oid: &str) -> Result<()> {
+        self.write_tag(0x06);
+        let bytes = oid_string_to_bytes(oid)?;
+        self.write_length(bytes.len());
+        self.buffer.extend_from_slice(&bytes);
+        Ok(())
     }
 
     fn write_length(&mut self, length: usize) {
@@ -521,11 +758,11 @@ impl BerWriter {
         };
 
         if length_bytes > 1 {
-            // Need to shift bytes
-            self.buffer.insert(sequence_start, 0x80 | (length_bytes - 1) as u8);
+            // Overwrite placeholder with first length byte, then insert remaining bytes (no remove)
+            self.buffer[sequence_start - 1] = 0x80 | (length_bytes - 1) as u8;
             for i in 0..(length_bytes - 1) {
                 let byte = (sequence_length >> (8 * (length_bytes - 2 - i))) & 0xFF;
-                self.buffer.insert(sequence_start + 1 + i, byte as u8);
+                self.buffer.insert(sequence_start + i, byte as u8);
             }
         } else {
             self.buffer[sequence_start - 1] = sequence_length as u8;
@@ -556,6 +793,8 @@ pub const LDAP_TAG_COMPARE_REQUEST: u8 = 0x6E;
 pub const LDAP_TAG_COMPARE_RESPONSE: u8 = 0x6F;
 pub const LDAP_TAG_EXTENDED_REQUEST: u8 = 0x77;
 pub const LDAP_TAG_EXTENDED_RESPONSE: u8 = 0x78;
+/// AbandonRequest [APPLICATION 16] - no response
+pub const LDAP_TAG_ABANDON_REQUEST: u8 = 0x50;
 /// [25] IMPLICIT - intermediate response
 pub const LDAP_TAG_INTERMEDIATE_RESPONSE: u8 = 0xB9;
 
@@ -591,6 +830,7 @@ pub fn parse_ldap_message(data: &[u8]) -> Result<LdapMessage> {
         LDAP_TAG_MODIFY_DN_REQUEST => ProtocolOp::ModifyDNRequest(parse_modify_dn_request(&mut reader)?),
         LDAP_TAG_COMPARE_REQUEST => ProtocolOp::CompareRequest(parse_compare_request(&mut reader)?),
         LDAP_TAG_EXTENDED_REQUEST => ProtocolOp::ExtendedRequest(parse_extended_request(&mut reader)?),
+        LDAP_TAG_ABANDON_REQUEST => ProtocolOp::AbandonRequest(reader.read_integer()?),
         _ => bail!("Unsupported LDAP operation tag: 0x{:02X}", tag),
     };
 
@@ -725,10 +965,7 @@ fn parse_search_request(reader: &mut BerReader) -> Result<SearchRequest> {
     let time_limit = reader.read_integer()?;
     let types_only = reader.read_boolean()?;
     
-    // Filter - simplified, just read as string for now
-    let _filter_tag = reader.read_tag()?;
-    let filter_bytes = reader.read_octet_string_value()?;
-    let filter = String::from_utf8_lossy(&filter_bytes).to_string();
+    let filter = parse_filter(reader)?;
     
     // Attributes
     let _attrs_tag = reader.read_tag()?;
@@ -749,6 +986,132 @@ fn parse_search_request(reader: &mut BerReader) -> Result<SearchRequest> {
         filter,
         attributes,
     })
+}
+
+/// RFC 4511 Filter CHOICE: [0]=and, [1]=or, [2]=not, [3]=equalityMatch, [4]=substrings, [5]=greaterOrEqual, [6]=lessOrEqual, [7]=present, [8]=approxMatch, [9]=extensibleMatch.
+fn parse_filter(reader: &mut BerReader) -> Result<Filter> {
+    let tag = reader.read_tag()?;
+    let len = reader.read_length()?;
+    let content = reader.read_raw_bytes(len)?;
+    parse_filter_content(&content, tag)
+}
+
+fn parse_filter_content(content: &[u8], tag: u8) -> Result<Filter> {
+    let mut sub = BerReader::new(content);
+    match tag {
+        0x80 => {
+            // and [0] SET OF filter
+            let mut filters = Vec::new();
+            while sub.remaining() > 0 {
+                filters.push(parse_filter(&mut sub)?);
+            }
+            Ok(Filter::And(filters))
+        }
+        0x81 => {
+            // or [1] SET OF filter
+            let mut filters = Vec::new();
+            while sub.remaining() > 0 {
+                filters.push(parse_filter(&mut sub)?);
+            }
+            Ok(Filter::Or(filters))
+        }
+        0x82 => {
+            // not [2] filter
+            let f = parse_filter(&mut sub)?;
+            Ok(Filter::Not(Box::new(f)))
+        }
+        0xA3 => {
+            // equalityMatch [3] AttributeValueAssertion SEQUENCE { attributeDesc, assertionValue }
+            let _seq = sub.read_sequence()?;
+            let attribute = sub.read_string()?;
+            let value = sub.read_octet_string()?;
+            Ok(Filter::EqualityMatch { attribute, value })
+        }
+        0xA4 => {
+            // substrings [4] SubstringFilter
+            let _seq = sub.read_sequence()?;
+            let attribute = sub.read_string()?;
+            let _seq2_tag = sub.read_tag()?;
+            let _seq2_len = sub.read_length()?;
+            let mut substrings = Vec::new();
+            while sub.remaining() > 0 {
+                let t = sub.read_tag()?;
+                let val = sub.read_octet_string_value()?;
+                let item = match t {
+                    0x80 => SubstringFilterItem::Initial(val),
+                    0x81 => SubstringFilterItem::Any(val),
+                    0x82 => SubstringFilterItem::Final(val),
+                    _ => continue,
+                };
+                substrings.push(item);
+            }
+            Ok(Filter::Substrings { attribute, substrings })
+        }
+        0xA5 => {
+            let _seq = sub.read_sequence()?;
+            let attribute = sub.read_string()?;
+            let value = sub.read_octet_string()?;
+            Ok(Filter::GreaterOrEqual { attribute, value })
+        }
+        0xA6 => {
+            let _seq = sub.read_sequence()?;
+            let attribute = sub.read_string()?;
+            let value = sub.read_octet_string()?;
+            Ok(Filter::LessOrEqual { attribute, value })
+        }
+        0x87 => {
+            // present [7] IMPLICIT AttributeDescription (OCTET STRING): content is raw bytes or inner 0x04 TLV
+            let attribute = if !content.is_empty() && content[0] == 0x04 {
+                sub.read_string()?
+            } else {
+                String::from_utf8_lossy(content).to_string()
+            };
+            Ok(Filter::Present(attribute))
+        }
+        0xA8 => {
+            let _seq = sub.read_sequence()?;
+            let attribute = sub.read_string()?;
+            let value = sub.read_octet_string()?;
+            Ok(Filter::ApproxMatch { attribute, value })
+        }
+        0xA9 => {
+            // extensibleMatch [9] MatchingRuleAssertion
+            let _seq = sub.read_sequence()?;
+            let mut matching_rule = None;
+            let mut typ = None;
+            let mut match_value = Vec::new();
+            let mut dn_attributes = false;
+            while sub.remaining() > 0 {
+                let t = sub.read_tag()?;
+                if (t & 0x1F) == 0x04 {
+                    let v = sub.read_octet_string_value()?;
+                    let s = String::from_utf8_lossy(&v).to_string();
+                    if matching_rule.is_none() {
+                        matching_rule = Some(s);
+                    } else if typ.is_none() {
+                        typ = Some(s);
+                    } else {
+                        match_value = v;
+                    }
+                } else if (t & 0x1F) == 0x01 {
+                    let _len = sub.read_length()?;
+                    let b = sub.read_raw_bytes(1)?;
+                    dn_attributes = !b.is_empty() && b[0] != 0;
+                }
+            }
+            if match_value.is_empty() && typ.is_some() {
+                match_value = typ.as_ref().map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+                typ = None;
+            }
+            Ok(Filter::ExtensibleMatch {
+                matching_rule,
+                typ,
+                match_value,
+                dn_attributes,
+            })
+        }
+        _ => Ok(Filter::Raw(tag, content.to_vec())),
+    }
 }
 
 fn parse_modify_request(reader: &mut BerReader) -> Result<ModifyRequest> {
@@ -923,8 +1286,33 @@ pub fn encode_ldap_message(message: &LdapMessage) -> Result<Vec<u8>> {
         _ => bail!("Cannot encode operation type"),
     }
     
+    if let Some(ref controls) = message.controls {
+        if !controls.is_empty() {
+            writer.write_tag(LDAP_CONTEXT_CONTROLS);
+            let ctrl_seq_start = writer.start_sequence();
+            for ctrl in controls {
+                encode_control(&mut writer, ctrl)?;
+            }
+            writer.end_sequence(ctrl_seq_start);
+        }
+    }
+    
     writer.end_sequence(seq_start);
     Ok(writer.into_vec())
+}
+
+/// Encode one Control: SEQUENCE { type, critical DEFAULT FALSE, value OPTIONAL }
+fn encode_control(writer: &mut BerWriter, ctrl: &Control) -> Result<()> {
+    let seq_start = writer.start_sequence();
+    writer.write_string(&ctrl.ctype);
+    if ctrl.critical {
+        writer.write_boolean(true);
+    }
+    if let Some(ref value) = ctrl.value {
+        writer.write_octet_string(value);
+    }
+    writer.end_sequence(seq_start);
+    Ok(())
 }
 
 fn encode_bind_response(writer: &mut BerWriter, resp: &BindResponse) -> Result<()> {
@@ -1315,7 +1703,9 @@ mod tests {
         let mut reader = BerReader::new(&data);
         let result = reader.read_enumerated().unwrap();
         assert_eq!(result, 2);
-    }    #[test]
+    }
+
+    #[test]
     fn test_ber_reader_sequence() {
         // SEQUENCE containing INTEGER 42
         let data = vec![0x30, 0x03, 0x02, 0x01, 0x2A];
@@ -1326,17 +1716,125 @@ mod tests {
         assert_eq!(value, 42);
     }
 
+    // --- BER full implementation tests: round-trip, boundaries, multi-byte tag, OID, invalid ---
+
+    #[test]
+    fn test_ber_roundtrip_octet_string_lengths() {
+        for len in [0_usize, 1, 127, 128, 256] {
+            let s = "x".repeat(len);
+            let mut writer = BerWriter::new();
+            writer.write_string(&s);
+            let encoded = writer.into_vec();
+            let mut reader = BerReader::new(&encoded);
+            let decoded = reader.read_octet_string().unwrap();
+            assert_eq!(decoded.len(), len, "length {}", len);
+            assert_eq!(decoded, s.as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_ber_length_boundary_127() {
+        let mut data = vec![0x04, 0x7F];
+        data.extend_from_slice(&[0u8; 127]);
+        let mut reader = BerReader::new(&data);
+        let result = reader.read_octet_string().unwrap();
+        assert_eq!(result.len(), 127);
+    }
+
+    #[test]
+    fn test_ber_length_boundary_128() {
+        let mut data = vec![0x04, 0x81, 0x80];
+        data.extend_from_slice(&[0u8; 128]);
+        let mut reader = BerReader::new(&data);
+        let result = reader.read_octet_string().unwrap();
+        assert_eq!(result.len(), 128);
+    }
+
+    #[test]
+    fn test_ber_oid_roundtrip() {
+        let oids = ["1.2.3", "1.2.840.113549", "1.3.6.1.4.1.4203.1.9.1.1"];
+        for oid in oids {
+            let mut writer = BerWriter::new();
+            writer.write_oid(oid).unwrap();
+            let encoded = writer.into_vec();
+            let mut reader = BerReader::new(&encoded);
+            let decoded = reader.read_oid().unwrap();
+            assert_eq!(decoded, oid, "OID roundtrip");
+        }
+    }
+
+    #[test]
+    fn test_ber_oid_bytes_to_string() {
+        // 1.2.840 = 0x2A 0x86 0x48 (BER encoding)
+        let bytes = vec![0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D]; // 1.2.840.113549
+        let s = oid_bytes_to_string(&bytes).unwrap();
+        assert_eq!(s, "1.2.840.113549");
+    }
+
+    #[test]
+    fn test_ber_tag_multibyte_read() {
+        // Single-byte tag: 0x04 (OCTET STRING)
+        let data = vec![0x04, 0x01, 0x00];
+        let mut reader = BerReader::new(&data);
+        let tag_bytes = reader.read_tag_multibyte().unwrap();
+        assert_eq!(tag_bytes, vec![0x04]);
+        // Multi-byte tag: 0x1F 0x81 0x00 (tag number 128 in high-tag form)
+        let data2 = vec![0x1F, 0x81, 0x00, 0x01, 0x01, 0xFF];
+        let mut reader2 = BerReader::new(&data2);
+        let tag_bytes2 = reader2.read_tag_multibyte().unwrap();
+        assert_eq!(tag_bytes2, vec![0x1F, 0x81, 0x00]);
+    }
+
+    #[test]
+    fn test_ber_write_tag_multi() {
+        let mut writer = BerWriter::new();
+        writer.write_tag_multi(&[0x1F, 0x81, 0x00]);
+        writer.write_string("x");
+        let out = writer.into_vec();
+        assert_eq!(out[0], 0x1F);
+        assert_eq!(out[1], 0x81);
+        assert_eq!(out[2], 0x00);
+    }
+
+    #[test]
+    fn test_ber_read_length_or_indefinite() {
+        let data = vec![0x04, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut reader = BerReader::new(&data);
+        reader.read_tag().unwrap();
+        let len = reader.read_length_or_indefinite().unwrap();
+        assert_eq!(len, Some(5));
+        let data_indef = vec![0x04, 0x80]; // indefinite
+        let mut reader2 = BerReader::new(&data_indef);
+        reader2.read_tag().unwrap();
+        let len2 = reader2.read_length_or_indefinite().unwrap();
+        assert_eq!(len2, None);
+    }
+
+    #[test]
+    fn test_ber_truncated_integer_fails() {
+        let data = vec![0x02, 0x02, 0xFF]; // INTEGER length 2 but only 1 byte
+        let mut reader = BerReader::new(&data);
+        assert!(reader.read_integer().is_err());
+    }
+
+    #[test]
+    fn test_ber_invalid_tag_fails() {
+        let data = vec![0x05, 0x00]; // NULL tag when expecting INTEGER
+        let mut reader = BerReader::new(&data);
+        assert!(reader.read_integer().is_err());
+    }
+
     /// LDAPMessage with BindRequest (simple bind, auth tag 0x80): SEQUENCE { id=1, bindRequest [0] { version=3, name, simple [0] "secret" } }
     #[test]
     fn test_parse_bind_request_simple_tag_0x80() {
-        // name = "cn=admin,dc=example,dc=com" (24 bytes), password = "secret" (6 bytes)
+        // name = "cn=admin,dc=example,dc=com" (26 bytes), password = "secret" (6 bytes). Bind content: 3+2+26+2+6 = 39 (0x27). Outer: 3+2+39 = 44 (0x2c).
         let msg = vec![
-            0x30, 0x2a, // SEQUENCE length 42
+            0x30, 0x2c, // SEQUENCE length 44
             0x02, 0x01, 0x01, // messageID 1
-            0x60, 0x25, // [0] BindRequest length 37
+            0x60, 0x27, // [0] BindRequest length 39
             0x02, 0x01, 0x03, // version 3
-            0x04, 0x18, 0x63, 0x6e, 0x3d, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x2c, 0x64, 0x63, 0x3d,
-            0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2c, 0x64, 0x63, 0x3d, 0x63, 0x6f, 0x6d, // name
+            0x04, 0x1a, 0x63, 0x6e, 0x3d, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x2c, 0x64, 0x63, 0x3d,
+            0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2c, 0x64, 0x63, 0x3d, 0x63, 0x6f, 0x6d, // name (26 bytes)
             0x80, 0x06, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74, // [0] simple OCTET STRING "secret"
         ];
         let parsed = parse_ldap_message(&msg).unwrap();
@@ -1358,11 +1856,9 @@ mod tests {
     #[test]
     fn test_parse_bind_request_simple_tag_0x61() {
         let msg = vec![
-            0x30, 0x2a,
-            0x02, 0x01, 0x01,
-            0x60, 0x25,
+            0x30, 0x2c, 0x02, 0x01, 0x01, 0x60, 0x27,
             0x02, 0x01, 0x03,
-            0x04, 0x18, 0x63, 0x6e, 0x3d, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x2c, 0x64, 0x63, 0x3d,
+            0x04, 0x1a, 0x63, 0x6e, 0x3d, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x2c, 0x64, 0x63, 0x3d,
             0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2c, 0x64, 0x63, 0x3d, 0x63, 0x6f, 0x6d,
             0x61, 0x06, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74, // 0x61 instead of 0x80
         ];
@@ -1382,11 +1878,9 @@ mod tests {
     #[test]
     fn test_parse_bind_request_simple_tag_0x41() {
         let msg = vec![
-            0x30, 0x2a,
-            0x02, 0x01, 0x01,
-            0x60, 0x25,
+            0x30, 0x2c, 0x02, 0x01, 0x01, 0x60, 0x27,
             0x02, 0x01, 0x03,
-            0x04, 0x18, 0x63, 0x6e, 0x3d, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x2c, 0x64, 0x63, 0x3d,
+            0x04, 0x1a, 0x63, 0x6e, 0x3d, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x2c, 0x64, 0x63, 0x3d,
             0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2c, 0x64, 0x63, 0x3d, 0x63, 0x6f, 0x6d,
             0x41, 0x06, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74, // 0x41 instead of 0x80
         ];
@@ -1406,11 +1900,9 @@ mod tests {
     #[test]
     fn test_parse_bind_request_simple_tag_0xd0() {
         let msg = vec![
-            0x30, 0x2a,
-            0x02, 0x01, 0x01,
-            0x60, 0x25,
+            0x30, 0x2c, 0x02, 0x01, 0x01, 0x60, 0x27,
             0x02, 0x01, 0x03,
-            0x04, 0x18, 0x63, 0x6e, 0x3d, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x2c, 0x64, 0x63, 0x3d,
+            0x04, 0x1a, 0x63, 0x6e, 0x3d, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x2c, 0x64, 0x63, 0x3d,
             0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2c, 0x64, 0x63, 0x3d, 0x63, 0x6f, 0x6d,
             0xD0, 0x06, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74, // 0xD0 instead of 0x80
         ];
@@ -1430,18 +1922,16 @@ mod tests {
     /// Parser reads: after 0xA3 the length, then read_string() = length+bytes (no inner tag).
     #[test]
     fn test_parse_bind_request_sasl_tag_0xa3() {
-        // SaslCredentials: A3 <len=9> <mech_len=8> "EXTERNAL"
-        // BindRequest: version(3) + name(26) + sasl(2+9)=40 → 0x60 0x28
-        // LDAPMessage: id(3) + bind(2+40)=45 → 0x30 0x2d
+        // SaslCredentials: A3 <len=10> mechanism 0x08 length 8 "EXTERNAL". BindRequest: version(3) + name(26) + sasl(2+10)=43 (0x2b). Outer: 3+2+43=48 (0x30).
         let msg = vec![
-            0x30, 0x2d, // SEQUENCE length 45
+            0x30, 0x30, // SEQUENCE length 48
             0x02, 0x01, 0x01, // messageID 1
-            0x60, 0x28, // [0] BindRequest length 40
+            0x60, 0x2b, // [0] BindRequest length 43
             0x02, 0x01, 0x03, // version 3
-            0x04, 0x18, 0x63, 0x6e, 0x3d, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x2c, 0x64, 0x63, 0x3d,
-            0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2c, 0x64, 0x63, 0x3d, 0x63, 0x6f, 0x6d, // name
-            0xA3, 0x09, // [3] SaslCredentials length 9
-            0x08, 0x45, 0x58, 0x54, 0x45, 0x52, 0x4e, 0x41, 0x4c, // mechanism len 8 + "EXTERNAL"
+            0x04, 0x1a, 0x63, 0x6e, 0x3d, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x2c, 0x64, 0x63, 0x3d,
+            0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2c, 0x64, 0x63, 0x3d, 0x63, 0x6f, 0x6d, // name (26 bytes)
+            0xA3, 0x0a, // [3] SaslCredentials length 10
+            0x08, 0x08, 0x45, 0x58, 0x54, 0x45, 0x52, 0x4e, 0x41, 0x4c, // mechanism: tag 0x08, length 8, "EXTERNAL"
         ];
         let parsed = parse_ldap_message(&msg).unwrap();
         assert_eq!(parsed.message_id, 1);
@@ -1520,5 +2010,105 @@ mod tests {
         let encoded = encode_ldap_message(&message).unwrap();
         assert!(!encoded.is_empty());
         assert_eq!(encoded[0], 0x30);
+    }
+
+    #[test]
+    fn test_encode_ldap_message_with_controls() {
+        let done = SearchResultDone {
+            result_code: 0,
+            matched_dn: String::new(),
+            diagnostic_message: String::new(),
+        };
+        let message = LdapMessage {
+            message_id: 2,
+            protocol_op: ProtocolOp::SearchResultDone(done),
+            controls: Some(vec![
+                Control {
+                    ctype: "1.2.840.113556.1.4.319".to_string(), // Paged Results OID
+                    critical: false,
+                    value: Some(vec![0x30, 0x00]), // empty cookie
+                },
+            ]),
+        };
+        let encoded = encode_ldap_message(&message).unwrap();
+        assert!(!encoded.is_empty());
+        assert!(encoded.contains(&0xA0), "encoded message should contain controls [0] 0xA0");
+        // OID is BER-encoded (not ASCII); control SEQUENCE contains type as OID bytes
+        assert!(encoded.len() > 30, "encoded message with control should have reasonable length");
+    }
+
+    #[test]
+    fn test_filter_present_to_ldap_string() {
+        let f = Filter::Present("objectClass".to_string());
+        assert_eq!(f.to_ldap_string(), "(objectClass=*)");
+    }
+
+    #[test]
+    fn test_filter_equality_to_ldap_string() {
+        let f = Filter::EqualityMatch {
+            attribute: "cn".to_string(),
+            value: b"admin".to_vec(),
+        };
+        assert_eq!(f.to_ldap_string(), "(cn=admin)");
+    }
+
+    #[test]
+    fn test_parse_search_request_with_filter_present() {
+        // LDAPMessage: SEQUENCE { messageID 1, SearchRequest { base "", scope 2, deref 0, sizeLimit 0, timeLimit 0, typesOnly false, filter present objectClass, attributes {} } }
+        // "objectClass" = 11 chars → 0x04 0x0B + 11 bytes = 13; filter 0x87 0x0D (13). SearchRequest: 17 + 2 + 13 + 2 = 34 (0x22). Outer: 3 + 2 + 34 = 39 (0x27).
+        let msg = vec![
+            0x30, 0x27, // SEQUENCE 39
+            0x02, 0x01, 0x01, // messageID 1
+            0x63, 0x22, // SearchRequest length 34
+            0x04, 0x00, // baseObject ""
+            0x0A, 0x01, 0x02, // scope wholeSubtree
+            0x0A, 0x01, 0x00, // derefAliases never
+            0x02, 0x01, 0x00, // sizeLimit 0
+            0x02, 0x01, 0x00, // timeLimit 0
+            0x01, 0x01, 0x00, // typesOnly false
+            0x87, 0x0D, 0x04, 0x0B, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x43, 0x6c, 0x61, 0x73, 0x73, // present "objectClass" (11 chars)
+            0x30, 0x00, // attributes empty SEQUENCE
+        ];
+        let parsed = parse_ldap_message(&msg).unwrap();
+        match &parsed.protocol_op {
+            ProtocolOp::SearchRequest(sr) => {
+                assert_eq!(sr.base_object, "");
+                assert_eq!(sr.scope, SearchScope::WholeSubtree);
+                match &sr.filter {
+                    Filter::Present(attr) => assert_eq!(attr, "objectClass"),
+                    _ => panic!("expected Present filter"),
+                }
+                assert_eq!(sr.filter.to_ldap_string(), "(objectClass=*)");
+            }
+            _ => panic!("expected SearchRequest"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_request_filter_equality() {
+        // Filter equalityMatch (cn=admin): [3] SEQUENCE { attributeDesc "cn", assertionValue "admin" }
+        // 0xA3 len 0x0D 0x30 0x0B 0x04 0x02 cn 0x04 0x05 admin
+        let msg = vec![
+            0x30, 0x1D, // SEQUENCE 29
+            0x02, 0x01, 0x01,
+            0x63, 0x19, // SearchRequest 25
+            0x04, 0x00, 0x0A, 0x01, 0x02, 0x0A, 0x01, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x01, 0x01, 0x00,
+            0xA3, 0x0D, 0x30, 0x0B, 0x04, 0x02, 0x63, 0x6E, 0x04, 0x05, 0x61, 0x64, 0x6D, 0x69, 0x6E, // equalityMatch cn=admin
+            0x30, 0x00,
+        ];
+        let parsed = parse_ldap_message(&msg).unwrap();
+        match &parsed.protocol_op {
+            ProtocolOp::SearchRequest(sr) => {
+                match &sr.filter {
+                    Filter::EqualityMatch { attribute, value } => {
+                        assert_eq!(attribute, "cn");
+                        assert_eq!(value.as_slice(), b"admin");
+                    }
+                    _ => panic!("expected EqualityMatch"),
+                }
+                assert_eq!(sr.filter.to_ldap_string(), "(cn=admin)");
+            }
+            _ => panic!("expected SearchRequest"),
+        }
     }
 }

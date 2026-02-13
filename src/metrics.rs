@@ -37,7 +37,7 @@ impl DurationHistogram {
 }
 
 /// Счётчики метрик (thread-safe, lock-free).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Metrics {
     /// Всего принятых клиентских подключений.
     pub connections_total: AtomicU64,
@@ -50,6 +50,8 @@ pub struct Metrics {
     pub requests_modify_dn: AtomicU64,
     pub requests_compare: AtomicU64,
     pub requests_extended: AtomicU64,
+    /// Ошибки парсинга LDAP-сообщений (невалидный BER / не SEQUENCE в начале).
+    pub parse_errors: AtomicU64,
     /// Ошибки по типам операций.
     pub errors_bind: AtomicU64,
     pub errors_search: AtomicU64,
@@ -60,6 +62,8 @@ pub struct Metrics {
     pub errors_compare: AtomicU64,
     pub errors_extended: AtomicU64,
     pub errors_other: AtomicU64,
+    /// Per-backend request counts: (uri, op) -> count. Used for ldap_lb_backend_requests_total.
+    backend_requests: dashmap::DashMap<(String, String), AtomicU64>,
     /// Duration (RED): гистограммы времени обработки по типу операции.
     duration_bind: DurationHistogram,
     duration_search: DurationHistogram,
@@ -69,6 +73,41 @@ pub struct Metrics {
     duration_modify_dn: DurationHistogram,
     duration_compare: DurationHistogram,
     duration_extended: DurationHistogram,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            connections_total: AtomicU64::new(0),
+            parse_errors: AtomicU64::new(0),
+            requests_bind: AtomicU64::new(0),
+            requests_search: AtomicU64::new(0),
+            requests_add: AtomicU64::new(0),
+            requests_modify: AtomicU64::new(0),
+            requests_delete: AtomicU64::new(0),
+            requests_modify_dn: AtomicU64::new(0),
+            requests_compare: AtomicU64::new(0),
+            requests_extended: AtomicU64::new(0),
+            errors_bind: AtomicU64::new(0),
+            errors_search: AtomicU64::new(0),
+            errors_add: AtomicU64::new(0),
+            errors_modify: AtomicU64::new(0),
+            errors_delete: AtomicU64::new(0),
+            errors_modify_dn: AtomicU64::new(0),
+            errors_compare: AtomicU64::new(0),
+            errors_extended: AtomicU64::new(0),
+            errors_other: AtomicU64::new(0),
+            backend_requests: dashmap::DashMap::new(),
+            duration_bind: DurationHistogram::default(),
+            duration_search: DurationHistogram::default(),
+            duration_add: DurationHistogram::default(),
+            duration_modify: DurationHistogram::default(),
+            duration_delete: DurationHistogram::default(),
+            duration_modify_dn: DurationHistogram::default(),
+            duration_compare: DurationHistogram::default(),
+            duration_extended: DurationHistogram::default(),
+        }
+    }
 }
 
 impl Metrics {
@@ -114,7 +153,23 @@ impl Metrics {
         }
     }
 
+    /// Увеличивает счётчик ошибок парсинга (ожидался SEQUENCE, пришёл другой тег и т.д.).
+    #[inline]
+    pub fn inc_parse_error(&self) {
+        self.parse_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Увеличивает счётчик ошибок по типу операции.
+    /// Increment per-backend request count (proxy mode). Call on successful request.
+    #[inline]
+    pub fn inc_backend_request(&self, uri: &str, op: &str) {
+        let key = (uri.to_string(), op.to_string());
+        self.backend_requests
+            .entry(key)
+            .or_insert_with(AtomicU64::default)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     #[inline]
     pub fn inc_error(&self, op: &str) {
         match op {
@@ -132,13 +187,18 @@ impl Metrics {
     }
 
     /// Рендер метрик в текстовом формате Prometheus (exposition format).
-    /// `backend_states`: список (uri, is_up) для метрик состояния узлов.
-    pub fn render(&self, backend_servers: usize, backend_states: &[(String, bool)]) -> String {
+    /// `backend_states`: список (uri, Some(is_up)) или (uri, None) когда health check отключён (unknown = -1).
+    pub fn render(&self, backend_servers: usize, backend_states: &[(String, Option<bool>)]) -> String {
         let mut out = String::new();
         let c = self.connections_total.load(Ordering::Relaxed);
         out.push_str("# HELP ldap_lb_connections_total Total number of client connections accepted.\n");
         out.push_str("# TYPE ldap_lb_connections_total counter\n");
         out.push_str(&format!("ldap_lb_connections_total {}\n", c));
+
+        let pe = self.parse_errors.load(Ordering::Relaxed);
+        out.push_str("# HELP ldap_lb_parse_errors_total Total number of LDAP message parse errors (invalid BER / wrong tag).\n");
+        out.push_str("# TYPE ldap_lb_parse_errors_total counter\n");
+        out.push_str(&format!("ldap_lb_parse_errors_total {}\n", pe));
 
         out.push_str("# HELP ldap_lb_requests_total Total LDAP requests by operation (success).\n");
         out.push_str("# TYPE ldap_lb_requests_total counter\n");
@@ -175,12 +235,24 @@ impl Metrics {
         out.push_str("# TYPE ldap_lb_backend_servers gauge\n");
         out.push_str(&format!("ldap_lb_backend_servers {}\n", backend_servers));
 
-        out.push_str("# HELP ldap_lb_backend_up Backend node state: 1 = up (healthy), 0 = down.\n");
+        out.push_str("# HELP ldap_lb_backend_up Backend node state: 1 = up (healthy), 0 = down, -1 = unknown (health check disabled).\n");
         out.push_str("# TYPE ldap_lb_backend_up gauge\n");
         for (uri, is_up) in backend_states {
-            let val = if *is_up { 1u8 } else { 0 };
+            let val = match is_up {
+                Some(true) => 1,
+                Some(false) => 0,
+                None => -1,
+            };
             let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
             out.push_str(&format!("ldap_lb_backend_up{{uri=\"{}\"}} {}\n", escaped, val));
+        }
+
+        out.push_str("# HELP ldap_lb_backend_requests_total Total requests forwarded to each backend by operation (proxy mode).\n");
+        out.push_str("# TYPE ldap_lb_backend_requests_total counter\n");
+        for entry in self.backend_requests.iter() {
+            let ((uri, op), count) = (entry.key(), entry.value().load(Ordering::Relaxed));
+            let u = uri.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!("ldap_lb_backend_requests_total{{uri=\"{}\",op=\"{}\"}} {}\n", u, op, count));
         }
 
         // RED: Duration — гистограмма длительности запросов по операциям
@@ -234,7 +306,8 @@ struct ReadyBody {
 #[derive(Serialize)]
 struct BackendState {
     uri: String,
-    up: bool,
+    /// true = up, false = down, null = unknown (health check disabled)
+    up: Option<bool>,
 }
 
 /// Извлекает путь из первой строки HTTP-запроса (например "GET /health HTTP/1.1" -> "/health").
@@ -253,11 +326,11 @@ fn request_path(first_line: &str) -> &str {
 /// Запускает HTTP-сервер для эндпоинтов GET /metrics, GET /health, GET /ready.
 /// - /health (liveness): 200 если процесс жив.
 /// - /ready (readiness): 200 если есть хотя бы один здоровый backend, иначе 503.
-/// `backend_info` вызывается при запросах /metrics и /ready: (число бэкендов, список (uri, is_up)).
+/// `backend_info` вызывается при запросах /metrics и /ready: (число бэкендов, список (uri, Option<is_up>); None = unknown when health disabled).
 pub async fn run_metrics_server(
     addr: &str,
     metrics: Arc<Metrics>,
-    backend_info: Arc<dyn Fn() -> (usize, Vec<(String, bool)>) + Send + Sync>,
+    backend_info: Arc<dyn Fn() -> (usize, Vec<(String, Option<bool>)>) + Send + Sync>,
 ) -> Result<()> {
     let socket_addr: SocketAddr = addr
         .parse()
@@ -311,7 +384,8 @@ pub async fn run_metrics_server(
                 "/health" => ("200 OK", "ok".to_string(), "text/plain; charset=utf-8"),
                 "/ready" => {
                     let (_count, states) = backend_info();
-                    let ready = states.iter().any(|(_, is_up)| *is_up);
+                    let ready = states.iter().any(|(_, is_up)| *is_up == Some(true))
+                        || (states.iter().all(|(_, u)| u.is_none()) && !states.is_empty());
                     let backends: Vec<BackendState> = states
                         .into_iter()
                         .map(|(uri, up)| BackendState { uri, up })
@@ -345,7 +419,7 @@ pub async fn run_metrics_server(
 
 #[cfg(test)]
 mod tests {
-    use super::request_path;
+    use super::{request_path, Metrics};
 
     #[test]
     fn test_request_path_health() {
@@ -366,5 +440,22 @@ mod tests {
     fn test_request_path_empty() {
         assert_eq!(request_path(""), "");
         assert_eq!(request_path("GET  HTTP/1.1"), "");
+    }
+
+    #[test]
+    fn test_backend_requests_metric() {
+        let m = Metrics::default();
+        m.inc_backend_request("ldap://ldap1:389", "search");
+        m.inc_backend_request("ldap://ldap1:389", "search");
+        m.inc_backend_request("ldap://ldap2:389", "bind");
+        let out = m.render(2, &[
+            ("ldap://ldap1:389".to_string(), Some(true)),
+            ("ldap://ldap2:389".to_string(), Some(true)),
+        ]);
+        assert!(out.contains("ldap_lb_backend_requests_total"));
+        assert!(out.contains("ldap://ldap1:389"));
+        assert!(out.contains("ldap://ldap2:389"));
+        assert!(out.contains("op=\"search\""));
+        assert!(out.contains("op=\"bind\""));
     }
 }
