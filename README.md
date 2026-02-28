@@ -209,10 +209,31 @@ docker compose down
 Сервисы:
 - **etcd** — порт 12379 на хосте (в сети контейнеров: etcd:2379)
 - **ldap1**, **ldap2**, **ldap3** — backend LDAP (OpenLDAP; для реального Samba AD нужен другой образ)
-- **ldap-load-balancer** — порт 1389
+- **ldap-load-balancer** — порт 1389 (LDAP)
+- **ldap-load-balancer-ldaps** — порт 636 (LDAPS, TLS с первого байта)
 - **ldap-client** — контейнер с `ldapsearch`/`ldapwhoami` для проверки запросов
 
-Конфиг балансировщика для Docker: `config.docker.yaml`.
+Конфиг балансировщика для Docker: `config.docker.yaml`. Конфиг LDAPS: `config.docker.ldaps.yaml`.
+
+### LDAPS (порт 636)
+
+Чтобы принимать клиентские подключения по **LDAPS** (TLS с первого байта), запустите отдельный сервис:
+
+```bash
+docker compose up -d ldap-load-balancer-ldaps
+```
+
+По умолчанию используются сертификаты из файлов (`docker/ldap1/certs` → `/etc/ldap-lb/certs`). Альтернатива: загрузка сертификатов из **etcd** — конфиг `config.docker.ldaps.etcd.yaml` с `tls.cert_etcd_key` и `tls.key_etcd_key`; загрузите конфиг и PEM в etcd (см. комментарии в файле), при необходимости смонтируйте этот конфиг как fallback и не монтируйте каталог с сертификатами.
+
+**Проверка с хоста** (для самоподписных сертификатов отключите проверку, только для теста):
+
+```bash
+ldapsearch -x -H ldaps://localhost:636 -b "dc=example,dc=com" -D "cn=admin,dc=example,dc=com" -w secret
+# Если сертификат самоподписный:
+LDAPTLS_REQCERT=never ldapsearch -x -H ldaps://localhost:636 -b "dc=example,dc=com" -D "cn=admin,dc=example,dc=com" -w secret
+```
+
+**Отдельные сертификаты для балансировщика** (CN/SAN для имени сервиса): см. [docker/ldap-lb/certs/README.md](docker/ldap-lb/certs/README.md) — генерация через `gen-certs.sh`, размещение в `docker/ldap-lb/certs/` и монтирование в контейнер.
 
 ### Быстрая пересборка и режим разработки
 

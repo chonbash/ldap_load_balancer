@@ -1,0 +1,9 @@
+# Add ACL rule to allow anonymous read on the directory.
+# Apply once per OpenLDAP container (ldap1, ldap2, ldap3) via:
+#   docker compose exec ldap1 ldapmodify -Y EXTERNAL -H ldapi:/// -f /opt/ldap1/acl-anonymous-read.ldif
+#
+# Required for test_07_anonymous_bind (anonymous bind + read of ou=anonymous-test).
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+add: olcAccess
+olcAccess: to * by * read

@@ -1,0 +1,41 @@
+# LDAPS listener (port 636) for Docker Compose.
+# TLS — один из вариантов:
+#   1) Из файлов (по умолчанию): cert_file/key_file, volume docker/ldap1/certs -> /etc/ldap-lb/certs.
+#   2) Из etcd: замените секцию tls на cert_etcd_key/key_etcd_key (см. config.docker.ldaps.etcd.yaml) и загрузите PEM в etcd.
+listen:
+  url: "ldaps://:636"
+
+metrics_listen: "0.0.0.0:9091"
+
+backend:
+  strategy: round_robin
+  health_check: whoami
+  sticky_writes: true
+  ring_hash_vnodes: 3
+
+  bind:
+    method: "simple"
+    binddn: "cn=admin,dc=example,dc=com"
+    credentials: "secret"
+    network_timeout: 5
+  servers:
+    - uri: "ldap://ldap1:389"
+      retry: 5
+      numconns: 5
+      bindconns: 2
+    - uri: "ldaps://ldap2:636"
+      retry: 5
+      numconns: 5
+      bindconns: 2
+    - uri: "ldap://ldap3:389"
+      retry: 5
+      numconns: 5
+      bindconns: 2
+
+io_threads: 2
+proxyauthz: false
+
+# Вариант из файлов (по умолчанию). Для etcd см. config.docker.ldaps.etcd.yaml.
+tls:
+  cert_file: "/etc/ldap-lb/certs/ldap1.crt"
+  key_file: "/etc/ldap-lb/certs/ldap1.key"

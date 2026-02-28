@@ -32,6 +32,7 @@ services:
       LDAP_TLS_VERIFY_CLIENT: try
     volumes:
       - ./docker/ldap1/certs:/container/service/slapd/assets/certs
+      - ./docker/ldap1:/opt/ldap1:ro
     networks:
       - ldapnet
 
@@ -51,6 +52,7 @@ services:
       LDAP_TLS_VERIFY_CLIENT: try
     volumes:
       - ./docker/ldap2/certs:/container/service/slapd/assets/certs
+      - ./docker/ldap1:/opt/ldap1:ro
     networks:
       - ldapnet
 
@@ -69,6 +71,7 @@ services:
       LDAP_TLS_VERIFY_CLIENT: try
     volumes:
       - ./docker/ldap3/certs:/container/service/slapd/assets/certs
+      - ./docker/ldap1:/opt/ldap1:ro
     networks:
       - ldapnet
 
@@ -100,6 +103,33 @@ services:
     networks:
       - ldapnet
 
+  # LDAPS-only балансировщик: порт 636, TLS из файлов (по умолчанию docker/ldap1/certs).
+  # Для отдельных сертификатов LB: см. docker/ldap-lb/certs/README.md, gen-certs.sh и volume ./docker/ldap-lb/certs:/etc/ldap-lb/certs:ro
+  ldap-load-balancer-ldaps:
+    build: .
+    hostname: ldap-lb-ldaps
+    ports:
+      - "636:636"
+      - "9091:9091"   # Prometheus metrics (отдельный порт от ldap-load-balancer)
+    command:
+      - "--etcd-endpoints=http://etcd:2379"
+      - "--etcd-config-key=/ldap-load-balancer/ldaps-config"
+      - "--etcd-fallback-file=/etc/ldap-lb/config.ldaps.yaml"
+    volumes:
+      - ./config.docker.ldaps.yaml:/etc/ldap-lb/config.ldaps.yaml:ro
+      - ./docker/ldap1/certs:/etc/ldap-lb/certs:ro
+    depends_on:
+      etcd:
+        condition: service_healthy
+      ldap1:
+        condition: service_started
+      ldap2:
+        condition: service_started
+      ldap3:
+        condition: service_started
+    networks:
+      - ldapnet
+
   # Несколько «подобных» клиентов без Kubernetes: docker compose up -d --scale ldap-client=5
   ldap-client:
     build:
@@ -111,6 +141,26 @@ services:
     environment:
       LDAP_HOST: ldap-load-balancer
       LDAP_PORT: "1389"
+    networks:
+      - ldapnet
+
+  # Тот же образ ldap-client, подключается по LDAPS к ldap-load-balancer-ldaps
+  ldap-client-ldaps:
+    build:
+      context: ./docker/ldap-client
+    depends_on:
+      ldap-load-balancer-ldaps:
+        condition: service_started
+    environment:
+      LDAP_SCHEME: ldaps
+      LDAP_HOST: ldap-load-balancer-ldaps
+      LDAP_PORT: "636"
+      LDAP_TLS_REQCERT: "never"
+      LDAPTLS_REQCERT: "never"
+      METRICS_HOST: ldap-load-balancer-ldaps
+      METRICS_PORT: "9091"
+      # Создавать тестового пользователя на всех бэкендах (нет репликации, round_robin)
+      LDAP_BACKEND_URIS: "ldap://ldap1:389,ldap://ldap2:389,ldap://ldap3:389"
     networks:
       - ldapnet
 

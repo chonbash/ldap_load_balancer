@@ -30,6 +30,7 @@
 ### 5. SASL в handler-режиме не поддерживается
 - **Проблема**: В `process_ldap_message` (сейчас не используется) при SASL Bind возвращается `authMethodNotSupported`.
 - **Контекст**: В текущем **proxy-режиме** SASL проходит транзитом (байты пересылаются без изменений) — GSSAPI/NTLM работают. Ограничение актуально только при включении handler-режима.
+- **GSSAPI и «Invalid credentials (49)”**: Балансировщик не формирует ответы на bind — только проксирует запросы/ответы. Если при GSSAPI через балансер приходит 49, это ответ **backend** (AD/LDAP). Частая причина — несовпадение SPN: клиент получает билет на имя, к которому подключается (например `ldap/ldap-balancer`), а backend ожидает свой SPN (например `ldap/dc1.elles.lan`). Решение — настройка Kerberos/AD: зарегистрировать SPN для имени балансера на учётной записи backend или использовать имя backend в подключении клиента.
 
 ### 6. StartTLS на входящем (клиентском) соединении
 - **Проблема**: Клиент может подключиться по `ldap://:389` и инициировать StartTLS. Балансировщик должен уметь «апгрейдить» TCP до TLS.
@@ -40,12 +41,10 @@
 - **Решение**: Либо применять `io_threads` при создании runtime, либо убрать из конфига.
 
 ### 8. Тестирование
-- **Есть**: Unit-тесты в `config.rs`, `ldap_handler.rs`, частично в `server.rs`.
+- **Есть**: Unit-тесты в `config.rs`, `ldap_handler.rs`, частично в `server.rs`. Интеграционные тесты в `docker/ldap-client/tests/` (pytest), покрывающие сценарии 01–23; отчёты JUnit XML и HTML.
 - **Нет**: 
-  - Интеграционные тесты (реальный LDAP backend)
-  - CI (GitHub Actions)
-  - Прогон скриптов `docker/ldap-client/scripts/*` в CI
-- **Решение**: Добавить интеграционные тесты, CI pipeline, проверку всех сценариев из `client-scenarios-matrix.md`.
+  - CI (GitHub Actions / GitLab CI) с прогоном интеграционных тестов и сохранением артефактов отчётов.
+- **Решение**: Добавить CI pipeline (поднять стек, запустить `docker compose run ldap-client`, сохранить `reports/junit.xml` и `reports/report.html`). См. `docker/ldap-client/README.md` — раздел «Подключение к CI».
 
 ### 9. Sticky sessions / affinity для операций записи
 - **Проблема**: При `strategy: random` или `round_robin` bind и последующие modify/add могут попасть на разные DC. До репликации — «пользователь не найден» / «неверный пароль» (см. `client-scenarios-matrix.md`, раздел 4).

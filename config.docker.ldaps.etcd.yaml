@@ -1,0 +1,42 @@
+# LDAPS listener (port 636); TLS сертификаты загружаются из etcd.
+# Загрузите этот конфиг в etcd: etcdctl put /ldap-load-balancer/ldaps-config "$(cat config.docker.ldaps.etcd.yaml)"
+# Затем загрузите PEM в ключи:
+#   etcdctl put /ldap-load-balancer/ldaps-tls/cert.pem "$(cat docker/ldap1/certs/ldap1.crt)"
+#   etcdctl put /ldap-load-balancer/ldaps-tls/key.pem "$(cat docker/ldap1/certs/ldap1.key)"
+# Для сервиса укажите fallback: --etcd-fallback-file=/etc/ldap-lb/config.ldaps.etcd.yaml и смонтируйте этот файл.
+listen:
+  url: "ldaps://:636"
+
+metrics_listen: "0.0.0.0:9091"
+
+backend:
+  strategy: round_robin
+  health_check: whoami
+  sticky_writes: true
+  ring_hash_vnodes: 3
+
+  bind:
+    method: "simple"
+    binddn: "cn=admin,dc=example,dc=com"
+    credentials: "secret"
+    network_timeout: 5
+  servers:
+    - uri: "ldap://ldap1:389"
+      retry: 5
+      numconns: 5
+      bindconns: 2
+    - uri: "ldap://ldap2:389"
+      retry: 5
+      numconns: 5
+      bindconns: 2
+    - uri: "ldap://ldap3:389"
+      retry: 5
+      numconns: 5
+      bindconns: 2
+
+io_threads: 2
+proxyauthz: false
+
+tls:
+  cert_etcd_key: "/ldap-load-balancer/ldaps-tls/cert.pem"
+  key_etcd_key: "/ldap-load-balancer/ldaps-tls/key.pem"

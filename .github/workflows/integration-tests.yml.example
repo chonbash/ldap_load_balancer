@@ -1,0 +1,37 @@
+# Пример: запуск интеграционных тестов в CI.
+# Переименуйте в integration-tests.yml (уберите .example), чтобы включить.
+#
+# Балансировщик читает конфиг из etcd или из --etcd-fallback-file (смонтирован config.docker.yaml).
+# Если нужен конфиг в etcd: после Start stack выполните
+#   docker compose exec -T etcd sh -c 'etcdctl put /ldap-load-balancer/config "$(cat -)"' < config.docker.yaml
+
+name: Integration tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack
+        run: |
+          docker compose up -d etcd ldap1 ldap2 ldap3 ldap-load-balancer
+          sleep 10
+
+      - name: Run integration tests
+        run: |
+          mkdir -p reports
+          docker compose run --rm -v "$(pwd)/reports:/reports" ldap-client
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: reports/

@@ -49,6 +49,8 @@ backend:
       numconns: 10
       bindconns: 5
 
+# TLS for the listener: required when listen.url is ldaps:// (e.g. ldaps://:636).
+# Cert and key from files or from etcd (cert_etcd_key, key_etcd_key). See admin-guide.
 tls:
   cert_file: "/usr/local/etc/openldap/cert.pem"
   key_file: "/usr/local/etc/openldap/key.pem"

@@ -967,12 +967,14 @@ fn parse_search_request(reader: &mut BerReader) -> Result<SearchRequest> {
     
     let filter = parse_filter(reader)?;
     
-    // Attributes
+    // Attributes: SEQUENCE OF LDAPString — parse only within the sequence so we don't consume trailing controls
     let _attrs_tag = reader.read_tag()?;
-    let _attrs_len = reader.read_length()?;
+    let attrs_len = reader.read_length()?;
+    let attrs_content = reader.read_raw_bytes(attrs_len)?;
+    let mut attrs_reader = BerReader::new(&attrs_content);
     let mut attributes = Vec::new();
-    while reader.remaining() > 0 {
-        let attr = reader.read_string()?;
+    while attrs_reader.remaining() > 0 {
+        let attr = attrs_reader.read_string()?;
         attributes.push(attr);
     }
 
@@ -1022,9 +1024,13 @@ fn parse_filter_content(content: &[u8], tag: u8) -> Result<Filter> {
         }
         0xA3 => {
             // equalityMatch [3] AttributeValueAssertion SEQUENCE { attributeDesc, assertionValue }
-            let _seq = sub.read_sequence()?;
-            let attribute = sub.read_string()?;
-            let value = sub.read_octet_string()?;
+            // Some clients (e.g. python-ldap) send two OCTET STRINGs directly without SEQUENCE wrapper.
+            let (attribute, value) = if !content.is_empty() && content[0] == 0x04 {
+                (sub.read_string()?, sub.read_octet_string()?)
+            } else {
+                let _seq = sub.read_sequence()?;
+                (sub.read_string()?, sub.read_octet_string()?)
+            };
             Ok(Filter::EqualityMatch { attribute, value })
         }
         0xA4 => {
@@ -1148,13 +1154,14 @@ fn parse_modify_request(reader: &mut BerReader) -> Result<ModifyRequest> {
 fn parse_add_request(reader: &mut BerReader) -> Result<AddRequest> {
     let _len = reader.read_length()?;
     let entry = reader.read_string()?;
-    
+    // AttributeList: SEQUENCE OF Attribute — parse only within the sequence
     let _attrs_tag = reader.read_tag()?;
-    let _attrs_len = reader.read_length()?;
+    let attrs_len = reader.read_length()?;
+    let attrs_content = reader.read_raw_bytes(attrs_len)?;
+    let mut attrs_reader = BerReader::new(&attrs_content);
     let mut attributes = Vec::new();
-    
-    while reader.remaining() > 0 {
-        let attr = parse_attribute(reader)?;
+    while attrs_reader.remaining() > 0 {
+        let attr = parse_attribute(&mut attrs_reader)?;
         attributes.push(attr);
     }
 

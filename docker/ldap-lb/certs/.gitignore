@@ -1,0 +1,10 @@
+# Generated TLS material — do not commit secrets
+key.pem
+*.key
+cert.pem
+*.crt
+*.csr
+ca.crt
+ca.key
+ca.srl
+dhparam.pem

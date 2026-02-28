@@ -20,6 +20,20 @@ TEST_USER_OU = os.environ.get("TEST_USER_OU", "ou=users")
 # Search base: OU containing the test user (so we only get that entry + changes)
 SEARCH_BASE = f"{TEST_USER_OU},{BASE_DN}"
 
+
+def _apply_ldap_tls(conn):
+    """Apply TLS options for LDAPS from env (LDAP_TLS_REQCERT=never, LDAP_TLS_CACERT)."""
+    if not LDAP_URI.startswith("ldaps://"):
+        return
+    tls_reqcert = os.environ.get("LDAP_TLS_REQCERT", "").strip().lower()
+    tls_cacert = os.environ.get("LDAP_TLS_CACERT", "").strip()
+    if tls_reqcert == "never":
+        conn.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+    if tls_cacert:
+        conn.set_option(ldap.OPT_X_TLS_CACERTFILE, tls_cacert)
+    conn.set_option(ldap.OPT_X_TLS_NEWCTX, 0)
+
+
 # Need 2 change entries (after refresh) to pass
 REQUIRED_PERSIST_ENTRIES = 2
 TIMEOUT_SEC = 25
@@ -69,6 +83,7 @@ class Consumer(SyncreplConsumer):
 def main():
     conn = ldap.initialize(LDAP_URI)
     conn.protocol_version = ldap.VERSION3
+    _apply_ldap_tls(conn)
     conn.simple_bind_s(BIND_DN, BIND_PW)
 
     consumer = Consumer(conn)

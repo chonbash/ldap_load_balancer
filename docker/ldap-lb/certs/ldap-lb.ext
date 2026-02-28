@@ -1,0 +1,10 @@
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = ldap-load-balancer
+DNS.2 = ldap-lb
+DNS.3 = ldap-lb-ldaps
+DNS.4 = localhost
