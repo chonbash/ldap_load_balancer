@@ -11,11 +11,11 @@ This guide is for infrastructure administrators (system administrators, DevOps) 
 ```mermaid
 flowchart TB
   subgraph clients[" "]
-    C[Clients LDAP apps]
+    C[Clients - LDAP apps]
   end
 
   subgraph tier1[" "]
-    LB["ldap-lb(LDAP Load Balancer)• Proxy / connection pool• Strategy: rr / random / ring_hash• Metrics :9090 (optional)"]
+    LB["ldap-lb[LDAP Load Balancer]• Proxy / connection pool• Strategy: rr / random / ring_hash• Metrics :9090 (optional)"]
     E[etcdconfig, TLSoptional]
   end
 
