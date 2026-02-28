@@ -15,8 +15,10 @@ flowchart TB
   end
 
   subgraph tier1[" "]
-    LB["ldap-lb[LDAP Load Balancer]• Proxy / connection pool• Strategy: rr / random / ring_hash• Metrics :9090 (optional)"]
-    E[etcdconfig, TLSoptional]
+    LB["LDAP Load Balancer"]
+    E["etcd
+-config
+-TLS config"]
   end
 
   subgraph backends["LDAP backends"]
