@@ -28,9 +28,9 @@ OpenLDAP / AD / Samba"]
 
   C -->|"LDAP :389/686"| LB
   E -.->|"config + watch"| LB
-  LB -->|LDAP proxy| B1
-  LB --> B2
-  LB --> B3
+  LB -->|LDAP| B1
+  LB -->|LDAPS| B2
+  LB -->|LDAP Proxy| B3
 ```
 
 - **ldap-lb**: Single entry point for clients; accepts LDAP on the listen port (e.g. 1389), optionally serves Prometheus metrics on 9090.
