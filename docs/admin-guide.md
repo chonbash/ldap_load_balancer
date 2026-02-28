@@ -16,9 +16,7 @@ flowchart TB
 
   subgraph tier1[" "]
     LB["LDAP Load Balancer"]
-    E["etcd
--config
--TLS config"]
+    E["etcd"]
   end
 
   subgraph backends["LDAP backends"]
@@ -27,7 +25,7 @@ flowchart TB
     B3[ldap-backend 3]
   end
 
-  C -->|"LDAP :1389"| LB
+  C -->|"LDAP :389/686"| LB
   E -.->|"config + watch"| LB
   LB -->|LDAP proxy| B1
   LB --> B2
