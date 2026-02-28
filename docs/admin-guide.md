@@ -19,8 +19,9 @@ flowchart TB
     E["etcd"]
   end
 
-  subgraph backends["LDAP backends"]
-    B1[ldap-backend 1 OpenLDAP / AD / Samba]
+  subgraph backends["LDAP backends
+OpenLDAP / AD / Samba"]
+    B1[ldap-backend 1]
     B2[ldap-backend 2]
     B3[ldap-backend 3]
   end
