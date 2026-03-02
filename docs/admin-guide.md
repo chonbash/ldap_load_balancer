@@ -52,7 +52,7 @@ LDAP Load Balancer is an LDAP v3 proxy that distributes client requests across m
 - **Proxy**: Forwards LDAP traffic (bytes) between clients and one backend per connection. In this mode it does not parse or modify bind credentials; SASL (GSSAPI, NTLM) and Simple Bind pass through.
 - **Connection pooling**: Maintains pools of connections to each backend (`numconns`, `bindconns`); reuses them for multiple client requests.
 - **Backend selection**: Chooses a backend per connection using a strategy: `random`, `round_robin`, or `ring_hash` (consistent hashing by client key, e.g. IP).
-- **Health checks**: Optional periodic checks (whoami, bind, or TCP) to mark backends up/down; state is exposed in metrics.
+- **Health checks**: Additional periodic checks (whoami, bind, or TCP) to mark backends as healthy/unhealthy; the status is displayed in metrics. By default, an anonymous whoami call is used and the bind section of the configuration is not used. If the check is configured as bind, you need to configure the bind section in the configuration.
 
 ### GSSAPI/Kerberos and keytab
 
